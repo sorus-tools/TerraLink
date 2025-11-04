@@ -1,0 +1,489 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<ui version="4.0">
+ <class>LinkscapeDialogBase</class>
+ <widget class="QDialog" name="LinkscapeDialogBase">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>500</width>
+    <height>600</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Linkscape</string>
+  </property>
+ <layout class="QVBoxLayout" name="verticalLayout">
+  <property name="spacing">
+   <number>8</number>
+  </property>
+  <property name="topMargin">
+   <number>8</number>
+  </property>
+  <property name="bottomMargin">
+   <number>8</number>
+  </property>
+   <item>
+    <widget class="QGroupBox" name="inputGroup">
+     <property name="title">
+      <string>Input Layer</string>
+     </property>
+     <layout class="QVBoxLayout" name="verticalLayout_2">
+      <item>
+       <layout class="QHBoxLayout" name="horizontalLayout">
+        <item>
+         <widget class="QLabel" name="label">
+          <property name="text">
+           <string>Layer Type:</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QComboBox" name="layer_type_combo">
+          <item>
+           <property name="text">
+            <string>Raster</string>
+           </property>
+          </item>
+          <item>
+           <property name="text">
+            <string>Vector</string>
+           </property>
+          </item>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <layout class="QHBoxLayout" name="horizontalLayout_2">
+        <item>
+         <widget class="QLabel" name="label_2">
+          <property name="text">
+           <string>Input Layer:</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QComboBox" name="input_layer_combo" />
+        </item>
+       </layout>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="outputGroup">
+     <property name="title">
+      <string>Output</string>
+     </property>
+     <layout class="QHBoxLayout" name="horizontalLayout_3">
+      <property name="spacing">
+       <number>6</number>
+      </property>
+      <property name="leftMargin">
+       <number>6</number>
+      </property>
+      <property name="topMargin">
+       <number>6</number>
+      </property>
+      <property name="rightMargin">
+       <number>6</number>
+      </property>
+      <property name="bottomMargin">
+       <number>6</number>
+      </property>
+      <item>
+       <widget class="QLineEdit" name="output_dir_line" />
+      </item>
+      <item>
+       <widget class="QPushButton" name="output_browse_button">
+       <property name="text">
+        <string>Browse...</string>
+       </property>
+      </widget>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="temporary_output_checkbox">
+        <property name="text">
+         <string>Create temporary layer</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="patchGroup">
+     <property name="title">
+      <string>Patch Definition (Raster)</string>
+     </property>
+     <layout class="QGridLayout" name="gridLayout_patch">
+      <item row="0" column="0">
+       <widget class="QLabel" name="label_patch_value">
+        <property name="text">
+         <string>Input value(s) to treat as patches</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QLineEdit" name="patch_value_line">
+        <property name="placeholderText">
+         <string>e.g. 3 or 3,5,7</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0" colspan="2">
+       <widget class="QCheckBox" name="range_checkbox">
+        <property name="text">
+         <string>Range</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="label_range_lower">
+        <property name="text">
+         <string>Range lower:</string>
+        </property>
+        <property name="visible">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QLineEdit" name="range_lower_line">
+        <property name="placeholderText">
+         <string>Enter lower value</string>
+        </property>
+        <property name="visible">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="0">
+       <widget class="QLabel" name="label_range_upper">
+        <property name="text">
+         <string>Range upper:</string>
+        </property>
+        <property name="visible">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <widget class="QLineEdit" name="range_upper_line">
+        <property name="placeholderText">
+         <string>Enter upper value</string>
+        </property>
+        <property name="visible">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="paramGroup">
+     <property name="title">
+      <string>Analysis Parameters</string>
+     </property>
+     <layout class="QGridLayout" name="gridLayout_params">
+      <item row="0" column="0"><widget class="QLabel" name="label_strategy"><property name="text"><string>Optimization mode:</string></property></widget></item><item row="0" column="1"><widget class="QComboBox" name="strategy_combo"><item><property name="text"><string>Most Connectivity</string></property></item><item><property name="text"><string>Largest Patch</string></property></item></widget></item><item row="1" column="0">
+       <widget class="QLabel" name="label_5">
+        <property name="text">
+         <string>Pixel Neighborhood</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1"><widget class="QComboBox" name="pixel_neighborhood_combo"><item><property name="text"><string>4</string></property></item><item><property name="text"><string>8</string></property></item><property name="currentIndex"><number>1</number></property></widget></item><item row="2" column="0">
+       <widget class="QLabel" name="label_7">
+        <property name="text">
+         <string>Min patch size (px):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QSpinBox" name="min_patch_size_spin">
+        <property name="maximum">
+         <number>10000</number>
+        </property>
+        <property name="toolTip">
+         <string>Filter out patches smaller than this many pixels.</string>
+        </property>
+       <property name="value"><number>100</number></property></widget>
+      </item>
+      <item row="3" column="0">
+       <widget class="QLabel" name="label_8">
+        <property name="text">
+         <string>Budget (px):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <widget class="QSpinBox" name="budget_spin">
+        <property name="maximum">
+         <number>100000</number>
+        </property>
+        <property name="toolTip">
+         <string>Total corridor pixels allowed.</string>
+        </property>
+       <property name="value"><number>50</number></property></widget>
+      </item>
+      <item row="4" column="0">
+       <widget class="QLabel" name="label_max_corridor_area">
+        <property name="text">
+         <string>Max corridor area (px):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="1">
+       <widget class="QSpinBox" name="max_corridor_area_spin">
+        <property name="maximum">
+         <number>1000000</number>
+        </property>
+        <property name="specialValueText">
+         <string>No limit</string>
+        </property>
+        <property name="toolTip">
+         <string>Optional cap on corridor pixels.</string>
+        </property>
+       <property name="value"><number>0</number></property></widget>
+      </item>
+      <item row="5" column="0">
+       <widget class="QLabel" name="label_9">
+        <property name="text">
+         <string>Max search distance (px):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="1">
+       <widget class="QSpinBox" name="max_search_spin">
+        <property name="maximum">
+         <number>10000</number>
+        </property>
+        <property name="toolTip">
+         <string>How far to look for patch connections.</string>
+        </property>
+       <property name="value"><number>50</number></property></widget>
+      </item>
+      <item row="6" column="0">
+       <widget class="QLabel" name="label_10">
+        <property name="text">
+         <string>Min corridor width (px):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="6" column="1">
+       <widget class="QSpinBox" name="min_corridor_width_spin">
+        <property name="maximum">
+         <number>1000</number>
+        </property>
+        <property name="toolTip">
+         <string>Minimum corridor thickness.</string>
+        </property>
+       <property name="value"><number>3</number></property></widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+  <item>
+   <widget class="QGroupBox" name="vectorGroup">
+     <property name="title">
+      <string>Vector Parameters</string>
+     </property>
+     <layout class="QFormLayout" name="formLayout_3">
+      <property name="horizontalSpacing">
+       <number>6</number>
+      </property>
+      <property name="verticalSpacing">
+       <number>6</number>
+      </property>
+      <property name="leftMargin">
+       <number>6</number>
+      </property>
+      <property name="topMargin">
+       <number>6</number>
+      </property>
+      <property name="rightMargin">
+       <number>6</number>
+      </property>
+      <property name="bottomMargin">
+       <number>6</number>
+      </property>
+      <item row="0" column="0">
+       <widget class="QLabel" name="label_vector_output">
+        <property name="text">
+         <string>Output File Name:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QLineEdit" name="vector_output_name_line">
+        <property name="text">
+         <string>linkscape_corridors.gpkg</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="label_vector_min_width">
+        <property name="text">
+         <string>Min Corridor Width (m):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QDoubleSpinBox" name="vector_min_corridor_width_spin">
+        <property name="decimals">
+         <number>2</number>
+        </property>
+        <property name="minimum">
+         <double>0.010000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>100000.000000000000000</double>
+        </property>
+        <property name="value"><number>200</number></property></widget>
+      </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="label_vector_max_area">
+        <property name="text">
+         <string>Max Corridor Area (ha):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QDoubleSpinBox" name="vector_max_corridor_area_spin">
+        <property name="decimals">
+         <number>2</number>
+        </property>
+        <property name="maximum">
+         <double>1000000.000000000000000</double>
+        </property>
+        <property name="specialValueText">
+         <string>No limit</string>
+        </property>
+        <property name="value"><number>0</number></property></widget>
+      </item>
+      <item row="3" column="0">
+       <widget class="QLabel" name="label_vector_min_patch">
+        <property name="text">
+         <string>Min Patch Size (ha):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="1">
+       <widget class="QDoubleSpinBox" name="vector_min_patch_size_spin">
+        <property name="decimals">
+         <number>2</number>
+        </property>
+        <property name="maximum">
+         <double>1000000.000000000000000</double>
+        </property>
+        <property name="value"><number>10</number></property></widget>
+      </item>
+      <item row="4" column="0">
+       <widget class="QLabel" name="label_vector_budget">
+        <property name="text">
+         <string>Budget (ha):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="1">
+       <widget class="QDoubleSpinBox" name="vector_budget_spin">
+        <property name="decimals">
+         <number>2</number>
+        </property>
+        <property name="maximum">
+         <double>1000000.000000000000000</double>
+        </property>
+        <property name="value"><number>50</number></property></widget>
+      </item>
+      <item row="5" column="0">
+       <widget class="QLabel" name="label_vector_max_search">
+        <property name="text">
+         <string>Max Search Distance (m):</string>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="1">
+       <widget class="QDoubleSpinBox" name="vector_max_search_spin">
+        <property name="decimals">
+         <number>1</number>
+        </property>
+        <property name="maximum">
+         <double>1000000.000000000000000</double>
+        </property>
+        <property name="value"><number>5000</number></property></widget>
+      </item>
+      <item row="6" column="0">
+       <widget class="QLabel" name="label_vector_units">
+        <property name="text">
+         <string>Units:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="6" column="1">
+       <widget class="QComboBox" name="vector_units_combo">
+        <item>
+         <property name="text">
+          <string>Metric (ha/m)</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>Imperial (ac/ft)</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QDialogButtonBox" name="button_box">
+     <property name="orientation">
+      <enum>Qt::Horizontal</enum>
+     </property>
+     <property name="standardButtons">
+      <set>QDialogButtonBox::Cancel|QDialogButtonBox::Ok</set>
+     </property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources />
+ <connections>
+  <connection>
+   <sender>button_box</sender>
+   <signal>accepted()</signal>
+   <receiver>LinkscapeDialogBase</receiver>
+   <slot>accept()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>248</x>
+     <y>254</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>157</x>
+     <y>274</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>button_box</sender>
+   <signal>rejected()</signal>
+   <receiver>LinkscapeDialogBase</receiver>
+   <slot>reject()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>316</x>
+     <y>260</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>286</x>
+     <y>274</y>
+    </hint>
+   </hints>
+  </connection>
+ </connections>
+</ui>

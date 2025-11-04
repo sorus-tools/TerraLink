@@ -1,0 +1,10 @@
+[general]
+name=Linkscape
+description=Linkscape corridor analysis tools by Benjamin Bishop
+version=1.0
+qgisMinimumVersion=3.0
+author=Benjamin Bishop
+email=benjamin.james.bishop@gmail.com
+about=Linkscape v1.0 runs raster and vector corridor connectivity analysis by Benjamin Bishop.
+category=Raster
+icon=icon.png
