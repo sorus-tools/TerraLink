@@ -1,0 +1,18 @@
+[general]
+name=LinkScape v1.5 Dev
+qgisMinimumVersion=3.22
+version=1.5.0
+author=Ben Bishop
+email=benjamin.james.bishop@gmail.com
+description=QGIS plugin for ecological corridor optimization and habitat connectivity analysis using raster and vector workflows.
+about=LinkScape identifies and optimizes ecological corridors connecting fragmented habitats using graph-based algorithms. Supports both raster (land cover grids) and vector (polygon patches) modes with dual optimization strategies—Most Connectivity and Largest Patch—featuring multi-step planning, automatic CRS handling, optional obstacle clipping, budget constraints, and flexible patch definitions for conservation planning at multiple scales.
+category=Analysis
+tags=ecology,connectivity,corridor,habitat,conservation,raster,vector,landscape,restoration,optimization,graph,theory,biodiversity,forest,planning
+icon=icon.png
+experimental=False
+deprecated=False
+homepage=https://github.com/sorus-tools/Linkscape
+repository=https://github.com/sorus-tools/Linkscape
+tracker=https://github.com/sorus-tools/Linkscape/issues
+changelog=Development snapshot for v1.5 branching from v1.4; metadata updated for the new iteration.
+license=GPL-2.0-or-later
