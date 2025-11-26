@@ -6,7 +6,7 @@ Linkscape is a QGIS plugin that identifies and optimizes ecological corridors to
 
 ![Alt text](example-optimized-corridor-locations.png)
 
-Image: Corridors generated (pink) to strategically connect the maximum landscape area (green) while avoiding impassable land type (orange)
+Image: Corridors generated (pink) to strategically connect the maximum amount of forested area (green) while avoiding impassable land type (orange)
 
 ---
 
