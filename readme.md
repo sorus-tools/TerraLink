@@ -58,7 +58,7 @@ Linkscape analyzes habitat patches (either raster cells or vector polygons) and 
 
 ![Alt text](example-corridor-avoiding-obstacles.png)
 
-Image: Corridor generated (pink) to connect patches and avoid impassable obstacles
+Image: Corridor automatically generated (pink) to connect patches (green) and avoid impassable obstacles (red)
 
 ## Installation & Access
 
