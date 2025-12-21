@@ -1,23 +1,40 @@
 import os
 from html import escape
 
+import re
 from typing import Dict, List, Optional, Union
 
 from qgis.PyQt import uic
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QTimer, QCoreApplication
 from qgis.PyQt.QtGui import QTextOption
 from qgis.PyQt.QtWidgets import (
     QFileDialog,
     QDialog,
-    QMessageBox,
     QTextBrowser,
     QHBoxLayout,
     QWidget,
     QTextEdit,
     QSplitter,
     QSizePolicy,
+    QListWidgetItem,
+    QLabel,
+    QComboBox,
+    QFormLayout,
+    QVBoxLayout,
+    QTabWidget,
+    QScrollArea,
+    QPlainTextEdit,
+    QProgressBar,
+    QMessageBox,
+    QDialogButtonBox,
+    QListWidget,
+    QLineEdit,
+    QSpinBox,
+    QToolButton,
+    QStackedWidget,
 )
-from qgis.core import QgsProject, QgsRasterLayer, QgsVectorLayer, QgsWkbTypes
+from qgis.core import QgsApplication, Qgis, QgsProject, QgsRasterLayer, QgsVectorLayer, QgsWkbTypes
+from qgis.gui import QgsCollapsibleGroupBox
 
 
 FORM_CLASS, _ = uic.loadUiType(os.path.join(
@@ -30,7 +47,17 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         self.setupUi(self)
         self.iface = iface
         self._help_browser: Optional[QTextBrowser] = None
-        self._inject_help_panel()
+        self._log_text: Optional[QPlainTextEdit] = None
+        self._progress_bar: Optional[QProgressBar] = None
+        self._progress_status_label: Optional[QLabel] = None
+        self._last_progress_value: Optional[int] = None
+        self._last_progress_message: Optional[str] = None
+        self._last_logged_progress_message: Optional[str] = None
+        self._last_logged_progress_value: Optional[int] = None
+        self._help_visible: bool = False
+        self._run_completed_successfully: bool = False
+        self._run_in_progress: bool = False
+        self._reframe_ui()
 
         self.output_dir_line.setPlaceholderText("Select output folder…")
 
@@ -41,14 +68,349 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
 
         self._connect_signals()
         self._configure_defaults()
+        self._auto_select_layer_type_from_active_layer()
         self._on_layer_type_changed(self.layer_type_combo.currentText())
+        QTimer.singleShot(0, self._ensure_initial_size)
+
+        try:
+            ok_btn = self.button_box.button(QDialogButtonBox.Ok)
+            if ok_btn is not None:
+                ok_btn.setText("Run")
+            cancel_btn = self.button_box.button(QDialogButtonBox.Cancel)
+            if cancel_btn is not None:
+                cancel_btn.setText("Close")
+        except Exception:
+            pass
+
+        try:
+            self.help_button = self.button_box.addButton("Help", QDialogButtonBox.HelpRole)
+            self.help_button.clicked.connect(self._toggle_help_panel)
+        except Exception:
+            self.help_button = None
+
+    def _ensure_initial_size(self) -> None:
+        # QGIS/Qt can sometimes ignore early resize() calls; enforce a sane minimum on first show.
+        target_w, target_h = 900, 700
+        try:
+            self.setMinimumSize(820, 620)
+        except Exception:
+            pass
+        try:
+            if self.width() < target_w or self.height() < target_h:
+                self.resize(max(self.width(), target_w), max(self.height(), target_h))
+        except Exception:
+            pass
+
+    def _auto_select_layer_type_from_active_layer(self) -> None:
+        try:
+            active = self.iface.activeLayer() if self.iface else None
+        except Exception:
+            active = None
+        if active is None:
+            return
+        try:
+            if isinstance(active, QgsVectorLayer):
+                idx = self.layer_type_combo.findText("Vector")
+                if idx >= 0:
+                    self.layer_type_combo.setCurrentIndex(idx)
+            elif isinstance(active, QgsRasterLayer):
+                idx = self.layer_type_combo.findText("Raster")
+                if idx >= 0:
+                    self.layer_type_combo.setCurrentIndex(idx)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # UI setup helpers
     # ------------------------------------------------------------------
 
+    def _set_collapsed(self, box: QWidget, collapsed: bool) -> None:
+        try:
+            if hasattr(box, "setCollapsed"):
+                box.setCollapsed(bool(collapsed))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    # Simple/Expert mode was removed: the UI is controlled by collapsible sections only.
+
+    def _reframe_ui(self) -> None:
+        """
+        Reframe the dialog around user decisions (Input → Goal → Constraints → Impassables → Advanced → Output)
+        while reusing existing widgets so the processing logic remains unchanged.
+        """
+        base_layout = self.layout()
+        if base_layout is None:
+            return
+
+        # Hide legacy group boxes; we'll re-parent the important controls into new sections.
+        for legacy in (
+            getattr(self, "inputGroup", None),
+            getattr(self, "patchGroup", None),
+            getattr(self, "strategyGroup", None),
+            getattr(self, "paramGroup", None),
+            getattr(self, "obstacleGroup", None),
+            getattr(self, "vectorGroup", None),
+            getattr(self, "vectorObstacleGroup", None),
+            getattr(self, "outputGroup", None),
+        ):
+            if isinstance(legacy, QWidget):
+                legacy.setVisible(False)
+
+        # Clear the base layout items.
+        while base_layout.count():
+            item = base_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+
+        # Root layout: left (tabs) + optional right help panel.
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        base_layout.addWidget(self.main_splitter)
+
+        self.left_panel = QWidget()
+        self.left_panel_layout = QVBoxLayout(self.left_panel)
+        self.left_panel_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_panel_layout.setSpacing(8)
+
+        self.help_panel = QTextBrowser()
+        self.help_panel.setOpenExternalLinks(True)
+        self.help_panel.setVisible(False)
+        self.help_panel.setMinimumWidth(280)
+        self._help_browser = self.help_panel
+        self._load_help_content()
+
+        self.main_splitter.addWidget(self.left_panel)
+        self.main_splitter.addWidget(self.help_panel)
+        try:
+            self.main_splitter.setSizes([9999, 0])
+        except Exception:
+            pass
+
+        # Tabs: Parameters | Log
+        self.tabs = QTabWidget(self)
+
+        self.params_tab = QWidget()
+        self.params_tab_layout = QVBoxLayout(self.params_tab)
+        self.params_tab_layout.setContentsMargins(0, 0, 0, 0)
+        self.params_tab_layout.setSpacing(0)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QScrollArea.NoFrame)
+
+        self.content = QWidget()
+        self.content_layout = QVBoxLayout(self.content)
+        self.content_layout.setContentsMargins(12, 12, 12, 12)
+        self.content_layout.setSpacing(10)
+        self.scroll.setWidget(self.content)
+        self.params_tab_layout.addWidget(self.scroll)
+
+        self.log_tab = QWidget()
+        self.log_tab_layout = QVBoxLayout(self.log_tab)
+        self.log_tab_layout.setContentsMargins(12, 12, 12, 12)
+        status_row = QWidget()
+        status_layout = QHBoxLayout(status_row)
+        status_layout.setContentsMargins(0, 0, 0, 6)
+        status_layout.setSpacing(8)
+        self._progress_status_label = QLabel("Idle")
+        self._progress_status_label.setWordWrap(True)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setTextVisible(False)
+        status_layout.addWidget(self._progress_status_label, 1)
+        status_layout.addWidget(self._progress_bar)
+        self.log_tab_layout.addWidget(status_row)
+        self.log_text = QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.log_tab_layout.addWidget(self.log_text)
+        self._log_text = self.log_text
+
+        self.tabs.addTab(self.params_tab, "Parameters")
+        self.tabs.addTab(self.log_tab, "Log")
+
+        self.left_panel_layout.addWidget(self.tabs)
+
+        # --- Input ---
+        self.section_input = QgsCollapsibleGroupBox("🧩 Input")
+        input_layout = QFormLayout(self.section_input)
+        input_layout.addRow("Layer type:", self.layer_type_combo)
+        input_layout.addRow("Input layer:", self.input_layer_combo)
+
+        # Units are a top-level choice for vector analysis.
+        self._vector_units_row = QWidget()
+        vector_units_layout = QFormLayout(self._vector_units_row)
+        vector_units_layout.setContentsMargins(0, 0, 0, 0)
+        vector_units_layout.addRow(self.label_vector_units, self.vector_units_combo)
+        input_layout.addRow(self._vector_units_row)
+
+        # Pixel neighborhood is a top-level choice for raster analysis.
+        self._raster_neighborhood_row = QWidget()
+        raster_neighborhood_layout = QFormLayout(self._raster_neighborhood_row)
+        raster_neighborhood_layout.setContentsMargins(0, 0, 0, 0)
+        raster_neighborhood_layout.addRow(self.label_5, self.pixel_neighborhood_combo)
+        input_layout.addRow(self._raster_neighborhood_row)
+
+        # Patch definition (conditional by layer type).
+        self._raster_patch_row = QWidget()
+        raster_patch_layout = QFormLayout(self._raster_patch_row)
+        raster_patch_layout.setContentsMargins(0, 0, 0, 0)
+        raster_patch_layout.addRow("Patch values:", self.patch_value_line)
+        raster_patch_layout.addRow("Min patch size (px):", self.min_patch_size_spin)
+        input_layout.addRow(self._raster_patch_row)
+
+        self._vector_patch_row = QWidget()
+        vector_patch_layout = QFormLayout(self._vector_patch_row)
+        vector_patch_layout.setContentsMargins(0, 0, 0, 0)
+        vector_patch_layout.addRow(self.label_vector_min_patch, self.vector_min_patch_size_spin)
+        input_layout.addRow(self._vector_patch_row)
+
+        self.content_layout.addWidget(self.section_input)
+
+        # --- Optimization Goal ---
+        self.section_goal = QgsCollapsibleGroupBox("🎯 Optimization Goal")
+        goal_layout = QVBoxLayout(self.section_goal)
+        goal_layout.setContentsMargins(6, 6, 6, 6)
+        goal_row = QWidget()
+        goal_row_layout = QHBoxLayout(goal_row)
+        goal_row_layout.setContentsMargins(0, 0, 0, 0)
+        goal_row_layout.addWidget(QLabel("Optimization mode:"))
+        goal_row_layout.addWidget(self.strategy_combo, 1)
+        goal_layout.addWidget(goal_row)
+        self.strategy_help_label = QLabel("")
+        self.strategy_help_label.setWordWrap(True)
+        goal_layout.addWidget(self.strategy_help_label)
+        self.content_layout.addWidget(self.section_goal)
+
+        # --- Core Constraints ---
+        self.section_constraints = QgsCollapsibleGroupBox("📏 Core Constraints")
+        constraints_layout = QVBoxLayout(self.section_constraints)
+        constraints_layout.setContentsMargins(6, 6, 6, 6)
+
+        self._raster_constraints_row = QWidget()
+        raster_constraints_layout = QFormLayout(self._raster_constraints_row)
+        raster_constraints_layout.setContentsMargins(0, 0, 0, 0)
+        raster_constraints_layout.addRow("Budget (px):", self.budget_spin)
+        raster_constraints_layout.addRow("Min corridor width (px):", self.min_corridor_width_spin)
+        raster_constraints_layout.addRow("Max search distance (px):", self.max_search_spin)
+        constraints_layout.addWidget(self._raster_constraints_row)
+
+        self._vector_constraints_row = QWidget()
+        vector_constraints_layout = QFormLayout(self._vector_constraints_row)
+        vector_constraints_layout.setContentsMargins(0, 0, 0, 0)
+        vector_constraints_layout.addRow(self.label_vector_budget, self.vector_budget_spin)
+        vector_constraints_layout.addRow(self.label_vector_min_width, self.vector_min_corridor_width_spin)
+        vector_constraints_layout.addRow(self.label_vector_max_search, self.vector_max_search_spin)
+        constraints_layout.addWidget(self._vector_constraints_row)
+
+        self.content_layout.addWidget(self.section_constraints)
+
+        # --- Impassable Land Classes ---
+        self.section_obstacles = QgsCollapsibleGroupBox("🚧 Impassable Land Classes")
+        obstacles_layout = QVBoxLayout(self.section_obstacles)
+        obstacles_layout.setContentsMargins(6, 6, 6, 6)
+
+        self._raster_obstacles_row = QWidget()
+        raster_obs_layout = QVBoxLayout(self._raster_obstacles_row)
+        raster_obs_layout.setContentsMargins(0, 0, 0, 0)
+        self.obstacle_enable_checkbox.setText("Enable impassable land classes")
+        raster_obs_layout.addWidget(self.obstacle_enable_checkbox)
+        raster_obs_form = QFormLayout()
+        raster_obs_form.setContentsMargins(0, 0, 0, 0)
+        self.label_obstacle_value.setText("Impassable values:")
+        raster_obs_form.addRow(self.label_obstacle_value, self.obstacle_value_line)
+        raster_obs_layout.addLayout(raster_obs_form)
+        raster_obs_layout.addWidget(self.allow_bottlenecks_checkbox)
+        self._vector_obstacles_row = QWidget()
+        vector_obs_layout = QVBoxLayout(self._vector_obstacles_row)
+        vector_obs_layout.setContentsMargins(0, 0, 0, 0)
+        self.vector_obstacle_enable_checkbox.setText("Enable impassable land classes")
+        vector_obs_layout.addWidget(self.vector_obstacle_enable_checkbox)
+        vector_obs_form = QFormLayout()
+        vector_obs_form.setContentsMargins(0, 0, 0, 0)
+        self.vector_obstacle_layer_list.setVisible(False)
+        obstacle_pick_row = QWidget()
+        obstacle_pick_layout = QHBoxLayout(obstacle_pick_row)
+        obstacle_pick_layout.setContentsMargins(0, 0, 0, 0)
+        self.vector_obstacle_selection_line = QLineEdit()
+        self.vector_obstacle_selection_line.setReadOnly(True)
+        self.vector_obstacle_selection_line.setText("0 inputs selected")
+        self.vector_obstacle_select_button = QToolButton()
+        self.vector_obstacle_select_button.setText("…")
+        self.vector_obstacle_select_button.clicked.connect(self._choose_vector_obstacle_layers)
+        obstacle_pick_layout.addWidget(self.vector_obstacle_selection_line, 1)
+        obstacle_pick_layout.addWidget(self.vector_obstacle_select_button)
+        self.label_vector_obstacle_layer.setText("Impassable layers:")
+        vector_obs_form.addRow(self.label_vector_obstacle_layer, obstacle_pick_row)
+        self.label_vector_obstacle_resolution.setText("Grid cell size:")
+        vector_obs_form.addRow(self.label_vector_obstacle_resolution, self.vector_obstacle_resolution_spin)
+        vector_obs_layout.addLayout(vector_obs_form)
+        # Stack raster/vector impassable controls to prevent any duplication in the layout.
+        self._obstacles_stack = QStackedWidget()
+        self._obstacles_stack.addWidget(self._raster_obstacles_row)
+        self._obstacles_stack.addWidget(self._vector_obstacles_row)
+        obstacles_layout.addWidget(self._obstacles_stack)
+
+        self.content_layout.addWidget(self.section_obstacles)
+
+        # --- Output ---
+        self.section_output = QgsCollapsibleGroupBox("💾 Output")
+        out_layout = QVBoxLayout(self.section_output)
+        out_layout.setContentsMargins(6, 6, 6, 6)
+
+        out_form = QFormLayout()
+        out_form.setContentsMargins(0, 0, 0, 0)
+        out_dir_row = QWidget()
+        out_dir_layout = QHBoxLayout(out_dir_row)
+        out_dir_layout.setContentsMargins(0, 0, 0, 0)
+        out_dir_layout.addWidget(self.output_dir_line, 1)
+        out_dir_layout.addWidget(self.output_browse_button)
+        out_dir_layout.addWidget(self.temporary_output_checkbox)
+        out_form.addRow("Output folder:", out_dir_row)
+        out_layout.addLayout(out_form)
+
+        self._vector_output_name_row = QWidget()
+        vector_out_form = QFormLayout(self._vector_output_name_row)
+        vector_out_form.setContentsMargins(0, 0, 0, 0)
+        vector_out_form.addRow(self.label_vector_output, self.vector_output_name_line)
+        out_layout.addWidget(self._vector_output_name_row)
+
+        self.content_layout.addWidget(self.section_output)
+        self.content_layout.addStretch(1)
+
+        self.left_panel_layout.addWidget(self.button_box)
+
+        # Initial collapse states
+        self._set_collapsed(self.section_input, False)
+        self._set_collapsed(self.section_goal, False)
+        self._set_collapsed(self.section_output, False)
+        self._set_collapsed(self.section_constraints, False)
+        self._set_collapsed(self.section_obstacles, True)
+
+        self._update_strategy_help()
+        try:
+            self.resize(900, 700)
+        except Exception:
+            pass
+        self._update_vector_obstacle_selector_text()
+
+    def _update_strategy_help(self) -> None:
+        if not hasattr(self, "strategy_help_label"):
+            return
+        key = self.strategy_combo.currentData() or self.strategy_combo.currentText()
+        text = ""
+        if key in ("largest_network", "Largest Network"):
+            text = "Prioritize one dominant connected network under budget."
+        elif key in ("circuit_utility", "Circuit Theory"):
+            text = "Maximize system-wide utility (ROI) under budget; can favor robust redundant links."
+        self.strategy_help_label.setText(text)
+
     def _inject_help_panel(self) -> None:
         """Add a right-hand help panel fed by a markdown file."""
+        # Deprecated: replaced by the Parameters|Log tab layout.
+        return
         base_layout = self.layout()
         if base_layout is None:
             return
@@ -59,6 +421,7 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         # Wrap the existing layout in a container widget so we can place it beside the help panel.
         left_container = QWidget()
         left_container.setLayout(base_layout)
+        left_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
         help_browser = QTextBrowser()
         help_browser.setObjectName("help_browser")
@@ -83,7 +446,81 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
 
         self.setLayout(wrapper)
         self._help_browser = help_browser
+        self.splitter = splitter
+        self.left_panel = left_container
+        self.help_panel = help_browser
         self._load_help_content()
+        return
+
+    # ------------------------------------------------------------------
+    # Log helpers
+    # ------------------------------------------------------------------
+
+    def _append_log(self, message: str, level: str = "INFO") -> None:
+        msg = (message or "").rstrip()
+        if not msg:
+            return
+        line = f"[{level}] {msg}"
+        if self._log_text is not None:
+            try:
+                self._log_text.appendPlainText(line)
+            except Exception:
+                pass
+        try:
+            level_key = (level or "INFO").upper()
+            qgis_level = Qgis.Info
+            if level_key in ("WARN", "WARNING"):
+                qgis_level = Qgis.Warning
+            elif level_key in ("ERR", "ERROR"):
+                qgis_level = Qgis.Critical
+            elif level_key in ("CRIT", "CRITICAL"):
+                qgis_level = Qgis.Critical
+            QgsApplication.messageLog().logMessage(msg, "TerraLink", level=qgis_level)
+        except Exception:
+            pass
+        try:
+            QCoreApplication.processEvents()
+        except Exception:
+            pass
+
+    def _progress_log(self, value: int, message: Optional[str] = None) -> None:
+        try:
+            pct = int(max(0, min(100, value)))
+        except Exception:
+            pct = 0
+        msg = (message or "").strip() if message else ""
+        same_as_last = pct == self._last_progress_value and msg == (self._last_progress_message or "")
+        self._last_progress_value = pct
+        self._last_progress_message = msg
+        try:
+            if self._progress_bar is not None:
+                self._progress_bar.setValue(pct)
+            if self._progress_status_label is not None:
+                if msg:
+                    self._progress_status_label.setText(f"{msg} ({pct}%)")
+                else:
+                    self._progress_status_label.setText(f"{pct}%")
+        except Exception:
+            pass
+
+        if same_as_last:
+            return
+
+        per_patch = bool(msg) and re.match(r"^(analyzing|finished) patch\\s+\\d+/\\d+", msg, re.IGNORECASE) is not None
+        if msg and (not per_patch):
+            log_step = 5
+            should_log = msg != (self._last_logged_progress_message or "")
+            if not should_log:
+                last_pct = self._last_logged_progress_value
+                should_log = last_pct is None or abs(pct - last_pct) >= log_step
+            if should_log:
+                self._last_logged_progress_message = msg
+                self._last_logged_progress_value = pct
+                self._append_log(f"{pct}% - {msg}", "PROGRESS")
+        try:
+            QCoreApplication.processEvents()
+        except Exception:
+            pass
 
     def _connect_signals(self):
         self.output_browse_button.clicked.connect(self._choose_output_dir)
@@ -92,16 +529,29 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         self.temporary_output_checkbox.toggled.connect(self._on_temporary_toggled)
         self.vector_units_combo.currentTextChanged.connect(self._update_vector_units_labels)
         self.strategy_combo.currentIndexChanged.connect(self._on_strategy_changed)
-        self.range_checkbox.toggled.connect(self._update_range_state)
         self.obstacle_enable_checkbox.toggled.connect(self._update_obstacle_controls)
-        self.obstacle_range_checkbox.toggled.connect(self._update_obstacle_range_state)
         self.vector_obstacle_enable_checkbox.toggled.connect(self._update_vector_obstacle_controls)
+
+    def _populate_strategy_combo(self) -> None:
+        self.strategy_combo.clear()
+        self.strategy_combo.addItems(
+            [
+                "Largest Network",
+                "Circuit Theory",
+            ]
+        )
+        self.strategy_combo.setItemData(0, "largest_network")
+        self.strategy_combo.setItemData(1, "circuit_utility")
+        # Default to Circuit Theory for new runs.
+        try:
+            self.strategy_combo.setCurrentIndex(1)
+        except Exception:
+            pass
 
     def _configure_defaults(self):
         self._vector_unit_system = "metric"
-        self.temporary_output_checkbox.setChecked(False)
-        self.strategy_combo.setItemData(0, "most_connectivity")
-        self.strategy_combo.setItemData(1, "largest_patch")
+        self._populate_strategy_combo()
+        self.temporary_output_checkbox.setChecked(True)
         self.vector_units_combo.setItemData(0, "metric")
         self.vector_units_combo.setItemData(1, "imperial")
         idx = self.pixel_neighborhood_combo.findText("8")
@@ -109,9 +559,38 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             self.pixel_neighborhood_combo.setCurrentIndex(idx)
         self._on_temporary_toggled(self.temporary_output_checkbox.isChecked())
         self._update_vector_units_labels(self.vector_units_combo.currentText())
-        self._update_range_state(self.range_checkbox.isChecked())
         self._update_obstacle_controls(self.obstacle_enable_checkbox.isChecked())
         self._update_vector_obstacle_controls(self.vector_obstacle_enable_checkbox.isChecked())
+
+        # Optional-by-default controls: show blank at 0 and treat it as "unset".
+        try:
+            self.min_patch_size_spin.setMinimum(0)
+            self.min_patch_size_spin.setSpecialValueText("")
+            # Raster defaults: 30 px minimum patch size.
+            self.min_patch_size_spin.setValue(30)
+        except Exception:
+            pass
+        try:
+            self.vector_min_patch_size_spin.setMinimum(0.0)
+            self.vector_min_patch_size_spin.setSpecialValueText("")
+            self.vector_min_patch_size_spin.setValue(0.0)
+        except Exception:
+            pass
+        try:
+            # Raster defaults: 10 px budget.
+            self.budget_spin.setValue(10)
+        except Exception:
+            pass
+        try:
+            # Vector defaults (metric): 1 ha budget, 20 m corridor width.
+            if self.vector_units_combo.currentData() == "imperial":
+                self.vector_budget_spin.setValue(round(1.0 * 2.471053814, 4))  # ha -> ac
+                self.vector_min_corridor_width_spin.setValue(round(20.0 * 3.280839895, 4))  # m -> ft
+            else:
+                self.vector_budget_spin.setValue(1.0)
+                self.vector_min_corridor_width_spin.setValue(20.0)
+        except Exception:
+            pass
 
     def _load_help_content(self) -> None:
         """Load markdown help content into the right-hand panel."""
@@ -119,7 +598,7 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             return
         help_path = os.path.join(os.path.dirname(__file__), "linkscape_help.md")
         if not os.path.exists(help_path):
-            self._help_browser.setPlainText("Linkscape\n\nHelp file not found.")
+            self._help_browser.setPlainText("TerraLink\n\nHelp file not found.")
             return
         try:
             with open(help_path, "r", encoding="utf-8") as fh:
@@ -137,7 +616,7 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
                 self._help_browser.setPlainText(f"Error loading help:\n{e}\n\n{text}")
 
         except Exception as exc:  # pragma: no cover - UI only
-            self._help_browser.setPlainText(f"Linkscape help could not be loaded:\n{exc}")
+            self._help_browser.setPlainText(f"TerraLink help could not be loaded:\n{exc}")
 
     def populate_layers(self):
         self.available_layers.clear()
@@ -178,20 +657,143 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
 
         self._on_layer_changed(self.input_layer_combo.currentIndex())
         self._populate_vector_obstacle_layers()
+        self._update_vector_obstacle_selector_text()
 
     def _populate_vector_obstacle_layers(self):
-        combo = self.vector_obstacle_layer_combo
-        combo.blockSignals(True)
-        combo.clear()
-        combo.addItem("None", "")
+        lst = self.vector_obstacle_layer_list
+        lst.blockSignals(True)
+        lst.clear()
+        try:
+            lst.setSelectionMode(QListWidget.MultiSelection)
+        except Exception:
+            pass
+        project = QgsProject.instance()
+        valid_layers = 0
+        for layer in project.mapLayers().values():
+            if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
+                continue
+            if QgsWkbTypes.geometryType(layer.wkbType()) != QgsWkbTypes.PolygonGeometry:
+                continue
+            item = QListWidgetItem(layer.name())
+            item.setData(Qt.UserRole, layer.id())
+            lst.addItem(item)
+            valid_layers += 1
+
+        if valid_layers == 0:
+            placeholder = QListWidgetItem("No polygon layers available")
+            placeholder.setFlags(Qt.NoItemFlags)
+            lst.addItem(placeholder)
+            lst.setEnabled(False)
+        else:
+            lst.setEnabled(True)
+
+        lst.blockSignals(False)
+        self._update_vector_obstacle_selector_text()
+
+    def _selected_vector_obstacle_layer_ids(self) -> List[str]:
+        ids: List[str] = []
+        for i in range(self.vector_obstacle_layer_list.count()):
+            item = self.vector_obstacle_layer_list.item(i)
+            if item is None or not item.isSelected():
+                continue
+            if not (item.flags() & Qt.ItemIsEnabled):
+                continue
+            layer_id = item.data(Qt.UserRole)
+            if layer_id:
+                ids.append(layer_id)
+        return ids
+
+    def _update_vector_obstacle_selector_text(self) -> None:
+        if not hasattr(self, "vector_obstacle_selection_line"):
+            return
+        ids = self._selected_vector_obstacle_layer_ids()
+        n = len(ids)
+        if n == 0:
+            text = "0 inputs selected"
+        elif n == 1:
+            text = "1 layer selected"
+        else:
+            text = f"{n} layers selected"
+        try:
+            self.vector_obstacle_selection_line.setText(text)
+        except Exception:
+            pass
+        try:
+            project = QgsProject.instance()
+            names = []
+            for lid in ids:
+                lyr = project.mapLayer(lid)
+                if lyr is not None:
+                    names.append(lyr.name())
+            tooltip = "\n".join(names) if names else text
+            self.vector_obstacle_selection_line.setToolTip(tooltip)
+        except Exception:
+            pass
+
+    def _choose_vector_obstacle_layers(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select impassable layers")
+        layout = QVBoxLayout(dlg)
+        layers_list = QListWidget()
+        layers_list.setSelectionMode(QListWidget.MultiSelection)
+        layout.addWidget(layers_list)
+
+        current_ids = set(self._selected_vector_obstacle_layer_ids())
         project = QgsProject.instance()
         for layer in project.mapLayers().values():
             if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
                 continue
             if QgsWkbTypes.geometryType(layer.wkbType()) != QgsWkbTypes.PolygonGeometry:
                 continue
-            combo.addItem(layer.name(), layer.id())
-        combo.blockSignals(False)
+            item = QListWidgetItem(layer.name())
+            item.setData(Qt.UserRole, layer.id())
+            if layer.id() in current_ids:
+                item.setSelected(True)
+            layers_list.addItem(item)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        chosen = set()
+        for i in range(layers_list.count()):
+            item = layers_list.item(i)
+            if item is None or not item.isSelected():
+                continue
+            layer_id = item.data(Qt.UserRole)
+            if layer_id:
+                chosen.add(layer_id)
+
+        self.vector_obstacle_layer_list.blockSignals(True)
+        for i in range(self.vector_obstacle_layer_list.count()):
+            item = self.vector_obstacle_layer_list.item(i)
+            if item is None:
+                continue
+            layer_id = item.data(Qt.UserRole)
+            item.setSelected(bool(layer_id and layer_id in chosen))
+        self.vector_obstacle_layer_list.blockSignals(False)
+        self._update_vector_obstacle_selector_text()
+
+    def _toggle_help_panel(self) -> None:
+        if not hasattr(self, "help_panel") or not hasattr(self, "main_splitter"):
+            return
+        self._help_visible = not bool(getattr(self, "_help_visible", False))
+        try:
+            self.help_panel.setVisible(self._help_visible)
+        except Exception:
+            return
+        try:
+            if self._help_visible:
+                self._load_help_content()
+                self.main_splitter.setSizes([9999, 380])
+            else:
+                self.main_splitter.setSizes([9999, 0])
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Slots
@@ -207,7 +809,7 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         layer = self._layer_from_index(index)
         if layer:
             self._selected_layer_id = layer.id()
-            if not self.output_dir_line.text():
+            if not self.temporary_output_checkbox.isChecked() and not self.output_dir_line.text():
                 self.output_dir_line.setText(os.path.dirname(layer.source()))
             if (
                 self._current_layer_type == "vector"
@@ -215,6 +817,36 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             ):
                 base_name = f"{layer.name()}_linkscape.gpkg"
                 self.vector_output_name_line.setText(base_name)
+
+            # Auto-fill max search distance when selecting a layer.
+            try:
+                def _round_nearest(value: float, step: float) -> float:
+                    if step <= 0:
+                        return value
+                    return round(value / step) * step
+
+                scaling_factor = 0.25
+                if self._current_layer_type == "vector" and isinstance(layer, QgsVectorLayer) and layer.isValid():
+                    extent = layer.extent()
+                    max_dim = max(extent.width(), extent.height())
+                    if max_dim > 0:
+                        value = max_dim * scaling_factor
+                        if self.vector_units_combo.currentData() == "imperial":
+                            value *= 3.280839895  # meters to feet
+                        self.vector_max_search_spin.blockSignals(True)
+                        self.vector_max_search_spin.setValue(_round_nearest(float(value), 5.0))
+                        self.vector_max_search_spin.blockSignals(False)
+                elif self._current_layer_type == "raster" and isinstance(layer, QgsRasterLayer) and layer.isValid():
+                    max_dim_px = max(int(layer.width()), int(layer.height()))
+                    if max_dim_px > 0:
+                        value_px = int(_round_nearest(float(max_dim_px * scaling_factor), 5.0))
+                        self.max_search_spin.blockSignals(True)
+                        self.max_search_spin.setValue(max(0, value_px))
+                        self.max_search_spin.blockSignals(False)
+            except Exception:
+                pass
+
+            self._update_vector_obstacle_selector_text()
 
     def _on_temporary_toggled(self, checked: bool):
         self.output_dir_line.setEnabled(not checked)
@@ -283,73 +915,63 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             self.label_vector_max_area.setText("Max Corridor Area (ha):")
 
     def _on_strategy_changed(self, _index: int):
-        # Placeholder for future dynamic behaviour.
-        return
-
-    def _update_range_state(self, checked: bool):
-        self.patch_value_line.setVisible(not checked)
-        self.label_patch_value.setVisible(not checked)
-        self.label_range_lower.setVisible(checked)
-        self.range_lower_line.setVisible(checked)
-        self.label_range_upper.setVisible(checked)
-        self.range_upper_line.setVisible(checked)
+        self._update_strategy_help()
 
     def _update_obstacle_controls(self, enabled: bool):
         is_enabled = bool(enabled)
         self.label_obstacle_value.setEnabled(is_enabled)
         self.obstacle_value_line.setEnabled(is_enabled)
-        self.obstacle_range_checkbox.setEnabled(is_enabled)
-        self._update_obstacle_range_state(self.obstacle_range_checkbox.isChecked())
         if not is_enabled:
             self.obstacle_value_line.clear()
-
-    def _update_obstacle_range_state(self, checked: bool):
-        is_enabled = self.obstacle_enable_checkbox.isChecked()
-        show_range = bool(checked) and is_enabled
-
-        self.label_obstacle_lower.setVisible(show_range)
-        self.obstacle_range_lower_line.setVisible(show_range)
-        self.label_obstacle_upper.setVisible(show_range)
-        self.obstacle_range_upper_line.setVisible(show_range)
-
-        self.label_obstacle_lower.setEnabled(show_range)
-        self.obstacle_range_lower_line.setEnabled(show_range)
-        self.label_obstacle_upper.setEnabled(show_range)
-        self.obstacle_range_upper_line.setEnabled(show_range)
-
-        value_enabled = is_enabled and not show_range
-        self.label_obstacle_value.setVisible(not show_range)
-        self.obstacle_value_line.setVisible(not show_range)
-        self.label_obstacle_value.setEnabled(value_enabled)
-        self.obstacle_value_line.setEnabled(value_enabled)
-
-        if not is_enabled:
-            self.obstacle_range_lower_line.clear()
-            self.obstacle_range_upper_line.clear()
 
     def _update_vector_obstacle_controls(self, enabled: bool):
         is_enabled = bool(enabled)
         self.label_vector_obstacle_layer.setEnabled(is_enabled)
-        self.vector_obstacle_layer_combo.setEnabled(is_enabled)
+        selectable = any(
+            self.vector_obstacle_layer_list.item(i).flags() & Qt.ItemIsEnabled
+            for i in range(self.vector_obstacle_layer_list.count())
+        )
+        if hasattr(self, "vector_obstacle_selection_line"):
+            self.vector_obstacle_selection_line.setEnabled(is_enabled and selectable)
+        if hasattr(self, "vector_obstacle_select_button"):
+            self.vector_obstacle_select_button.setEnabled(is_enabled and selectable)
         self.label_vector_obstacle_resolution.setEnabled(is_enabled)
         self.vector_obstacle_resolution_spin.setEnabled(is_enabled)
         if not is_enabled:
-            self.vector_obstacle_layer_combo.setCurrentIndex(0)
+            self.vector_obstacle_layer_list.clearSelection()
+            self._update_vector_obstacle_selector_text()
 
     def _on_layer_type_changed(self, text: str):
         self._current_layer_type = (text or "Raster").lower()
         self._update_group_visibility()
         self.populate_layers()
-        if self._current_layer_type == "raster":
-            self._update_range_state(self.range_checkbox.isChecked())
 
     def _update_group_visibility(self):
         is_raster = self._current_layer_type == "raster"
-        self.patchGroup.setVisible(is_raster)
-        self.paramGroup.setVisible(is_raster)
-        self.obstacleGroup.setVisible(is_raster)
-        self.vectorGroup.setVisible(not is_raster)
-        self.vectorObstacleGroup.setVisible(not is_raster)
+        # Conditional rows inside reframed UI.
+        if hasattr(self, "_raster_patch_row"):
+            self._raster_patch_row.setVisible(is_raster)
+        if hasattr(self, "_vector_patch_row"):
+            self._vector_patch_row.setVisible(not is_raster)
+        if hasattr(self, "_vector_units_row"):
+            self._vector_units_row.setVisible(not is_raster)
+        if hasattr(self, "_raster_neighborhood_row"):
+            self._raster_neighborhood_row.setVisible(is_raster)
+        if hasattr(self, "_raster_constraints_row"):
+            self._raster_constraints_row.setVisible(is_raster)
+        if hasattr(self, "_vector_constraints_row"):
+            self._vector_constraints_row.setVisible(not is_raster)
+        if hasattr(self, "_raster_obstacles_row"):
+            self._raster_obstacles_row.setVisible(is_raster)
+        if hasattr(self, "_vector_obstacles_row"):
+            self._vector_obstacles_row.setVisible(not is_raster)
+        if hasattr(self, "_obstacles_stack"):
+            try:
+                self._obstacles_stack.setCurrentIndex(0 if is_raster else 1)
+            except Exception:
+                pass
+        if hasattr(self, "_vector_output_name_row"):
+            self._vector_output_name_row.setVisible(not is_raster)
 
     # ------------------------------------------------------------------
     # Data extraction helpers
@@ -380,7 +1002,7 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         return self._parameters.get("params", {})
 
     def get_strategy(self) -> str:
-        return self._parameters.get("strategy", "most_connectivity")
+        return str(self.strategy_combo.currentData() or "circuit_utility")
 
     def use_temporary_output(self) -> bool:
         return self._parameters.get("use_temporary_output", False)
@@ -408,24 +1030,23 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
 
     def _collect_parameters(self) -> Dict:
         params = self._collect_vector_parameters() if self._current_layer_type == "vector" else self._collect_raster_parameters()
-        params["strategy"] = self.strategy_combo.currentData() or "most_connectivity"
+        params["strategy"] = self.strategy_combo.currentData() or "circuit_utility"
         return params
 
     def _collect_raster_parameters(self) -> Dict:
         connectivity = int(self.pixel_neighborhood_combo.currentText())
-        use_range = self.range_checkbox.isChecked()
         params = {
             "patch_connectivity": connectivity,
-            "patch_mode": "range" if use_range else "value",
+            "patch_mode": "value",
             "patch_values": [],
             "range_lower": None,
             "range_upper": None,
             "value_tolerance": 1e-6,
             "nodata_fallback": -9999.0,
             "min_patch_size": self.min_patch_size_spin.value(),
+            "allow_sub_min_corridor": True,
             "budget_pixels": self.budget_spin.value(),
             "max_search_distance": self.max_search_spin.value(),
-            "max_corridor_area": self.max_corridor_area_spin.value() or None,
             "min_corridor_width": self.min_corridor_width_spin.value(),
             "allow_bottlenecks": self.allow_bottlenecks_checkbox.isChecked(),
             "obstacle_enabled": self.obstacle_enable_checkbox.isChecked(),
@@ -435,48 +1056,16 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             "obstacle_range_upper": None,
         }
 
-        if use_range:
-            lower_text = self.range_lower_line.text().strip()
-            upper_text = self.range_upper_line.text().strip()
-            if not lower_text or not upper_text:
-                raise ValueError("Provide both lower and upper values for the range.")
-            try:
-                lower = float(lower_text)
-                upper = float(upper_text)
-            except ValueError as exc:
-                raise ValueError("Range bounds must be numeric.") from exc
-            if lower > upper:
-                lower, upper = upper, lower
-            params["range_lower"] = lower
-            params["range_upper"] = upper
-        else:
-            values = self._parse_values(self.patch_value_line.text())
-            if not values:
-                raise ValueError("Enter at least one patch value.")
-            params["patch_values"] = values
+        values = self._parse_values(self.patch_value_line.text())
+        if not values:
+            raise ValueError("Enter at least one patch value.")
+        params["patch_values"] = values
 
         if params["obstacle_enabled"]:
-            obstacle_is_range = self.obstacle_range_checkbox.isChecked()
-            params["obstacle_mode"] = "range" if obstacle_is_range else "value"
-            if obstacle_is_range:
-                lower_text = self.obstacle_range_lower_line.text().strip()
-                upper_text = self.obstacle_range_upper_line.text().strip()
-                if not lower_text or not upper_text:
-                    raise ValueError("Provide both lower and upper values for the obstacle range.")
-                try:
-                    lower = float(lower_text)
-                    upper = float(upper_text)
-                except ValueError as exc:
-                    raise ValueError("Obstacle range bounds must be numeric.") from exc
-                if lower > upper:
-                    lower, upper = upper, lower
-                params["obstacle_range_lower"] = lower
-                params["obstacle_range_upper"] = upper
-            else:
-                obstacle_values = self._parse_values(self.obstacle_value_line.text())
-                if not obstacle_values:
-                    raise ValueError("Enter at least one obstacle value.")
-                params["obstacle_values"] = obstacle_values
+            obstacle_values = self._parse_values(self.obstacle_value_line.text())
+            if not obstacle_values:
+                raise ValueError("Enter at least one impassable value.")
+            params["obstacle_values"] = obstacle_values
 
         return params
 
@@ -488,73 +1077,148 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         search_value = self.vector_max_search_spin.value()
         min_patch_value = self.vector_min_patch_size_spin.value()
         budget_value = self.vector_budget_spin.value()
-        max_area_value = self.vector_max_corridor_area_spin.value()
         obstacle_enabled = self.vector_obstacle_enable_checkbox.isChecked()
-        obstacle_layer_id = self.vector_obstacle_layer_combo.currentData()
         resolution_value = self.vector_obstacle_resolution_spin.value()
+        obstacle_layer_ids: List[str] = []
+        for i in range(self.vector_obstacle_layer_list.count()):
+            item = self.vector_obstacle_layer_list.item(i)
+            if item is None or not item.isSelected():
+                continue
+            if not (item.flags() & Qt.ItemIsEnabled):
+                continue
+            layer_id = item.data(Qt.UserRole)
+            if layer_id:
+                obstacle_layer_ids.append(layer_id)
 
         if units == "imperial":
             width_value *= 0.3048
             search_value *= 0.3048
             min_patch_value *= 0.404685642
             budget_value *= 0.404685642
-            max_area_value = max_area_value * 0.404685642 if max_area_value else None
             resolution_value *= 0.3048
-        else:
-            max_area_value = max_area_value or None
+        # Max corridor area removed from UI; no explicit limit is passed.
 
-        if obstacle_enabled and not obstacle_layer_id:
-            raise ValueError("Select an obstacle layer to enable obstacle avoidance.")
+        if obstacle_enabled and not obstacle_layer_ids:
+            raise ValueError("Select at least one impassable layer to enable impassable land classes.")
 
         return {
             "min_corridor_width": width_value,
-            "max_corridor_area": max_area_value,
             "min_patch_size": min_patch_value,
             "budget_area": budget_value,
             "max_search_distance": search_value,
             "output_name": output_name,
             "unit_system": units,
-            "obstacle_enabled": obstacle_enabled and bool(obstacle_layer_id),
-            "obstacle_layer_id": obstacle_layer_id if obstacle_enabled else None,
+            "obstacle_enabled": obstacle_enabled and bool(obstacle_layer_ids),
+            "obstacle_layer_ids": obstacle_layer_ids if obstacle_enabled else [],
+            "obstacle_layer_id": obstacle_layer_ids[0] if obstacle_layer_ids else None,
             "grid_resolution": resolution_value,
         }
 
     def accept(self):
+        if getattr(self, "_run_in_progress", False):
+            return
+        if getattr(self, "_run_completed_successfully", False):
+            self.close()
+            return
+
+        # Run in-dialog so the Log tab can show progress and results.
+        try:
+            if hasattr(self, "tabs") and hasattr(self, "log_tab"):
+                self.tabs.setCurrentWidget(self.log_tab)
+        except Exception:
+            pass
+
+        self._run_in_progress = True
+        ok_btn = None
+        try:
+            ok_btn = self.button_box.button(QDialogButtonBox.Ok)
+            if ok_btn is not None:
+                ok_btn.setEnabled(False)
+        except Exception:
+            ok_btn = None
+
+        self._last_progress_value = None
+        self._last_progress_message = None
+        self._last_logged_progress_message = None
+        self._last_logged_progress_value = None
+        try:
+            if self._progress_bar is not None:
+                self._progress_bar.setValue(0)
+            if self._progress_status_label is not None:
+                self._progress_status_label.setText("Starting…")
+        except Exception:
+            pass
+        self._append_log("Starting TerraLink run…", "INFO")
+
         layer = self._layer_from_index(self.input_layer_combo.currentIndex())
         expected_cls = QgsRasterLayer if self._current_layer_type == "raster" else QgsVectorLayer
         if layer is None or not isinstance(layer, expected_cls) or not layer.isValid():
-            msg = "Select a valid raster layer before running." if self._current_layer_type == "raster" else \
-                "Select a valid vector layer before running."
-            QMessageBox.warning(self, "Linkscape", msg)
+            msg = (
+                "Select a valid raster layer before running."
+                if self._current_layer_type == "raster"
+                else "Select a valid vector layer before running."
+            )
+            self._append_log(msg, "ERROR")
+            self._run_in_progress = False
+            try:
+                if ok_btn is not None:
+                    ok_btn.setEnabled(True)
+            except Exception:
+                pass
             return
 
         use_temporary = self.temporary_output_checkbox.isChecked()
         output_dir = self.output_dir_line.text().strip()
         if not use_temporary and not output_dir:
-            QMessageBox.warning(self, "Linkscape", "Select an output directory.")
+            msg = "Select an output directory (or enable Temporary output)."
+            self._append_log(msg, "ERROR")
+            self._run_in_progress = False
+            try:
+                if ok_btn is not None:
+                    ok_btn.setEnabled(True)
+            except Exception:
+                pass
             return
 
         try:
             params = self._collect_parameters()
         except ValueError as exc:
-            QMessageBox.warning(self, "Linkscape", str(exc))
+            self._append_log(str(exc), "ERROR")
+            self._run_in_progress = False
+            try:
+                if ok_btn is not None:
+                    ok_btn.setEnabled(True)
+            except Exception:
+                pass
             return
 
-        strategy = params.pop("strategy", "most_connectivity")
+        strategy = params.pop("strategy", "circuit_utility")
 
-        if not use_temporary:
+        # Ensure usable output directory (even for temporary runs)
+        if use_temporary:
+            if not output_dir:
+                import tempfile
+
+                output_dir = tempfile.mkdtemp(prefix="linkscape_temp_")
+                self._append_log(f"Created temporary output directory: {output_dir}", "INFO")
+        else:
             try:
                 os.makedirs(output_dir, exist_ok=True)
-            except OSError as exc:  # noqa: PERF203
-                QMessageBox.warning(
-                    self,
-                    "Linkscape",
-                    f"Unable to create or access the output directory:\n{exc}",
-                )
+            except OSError as exc:
+                msg = f"Unable to create or access the output directory:\n{exc}"
+                self._append_log(msg, "ERROR")
+                self._run_in_progress = False
+                try:
+                    if ok_btn is not None:
+                        ok_btn.setEnabled(True)
+                except Exception:
+                    pass
                 return
-        else:
-            output_dir = ""
 
+        self._append_log(f"Layer: {layer.name()} ({self._current_layer_type})", "INFO")
+        self._append_log(f"Strategy: {strategy}", "INFO")
+
+        # Keep the legacy parameter bundle updated (used by older call sites).
         self._parameters = {
             "layer_id": layer.id(),
             "layer_type": self._current_layer_type,
@@ -564,4 +1228,97 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             "use_temporary_output": use_temporary,
         }
 
-        super(LinkscapeDialog, self).accept()
+        try:
+            if self._current_layer_type == "vector":
+                feat_count = 0
+                try:
+                    feat_count = layer.featureCount()
+                except Exception:
+                    feat_count = 0
+                if feat_count <= 1:
+                    msg = (
+                        "Vector mode requires multiple features (one per patch). "
+                        "Your layer currently contains a single feature."
+                    )
+                    self._append_log(msg, "ERROR")
+                    self._run_in_progress = False
+                    try:
+                        if ok_btn is not None:
+                            ok_btn.setEnabled(True)
+                    except Exception:
+                        pass
+                    return
+
+            results = []
+            if self._current_layer_type == "vector":
+                from .analysis_vector import VectorAnalysisError, run_vector_analysis
+
+                results = run_vector_analysis(
+                    layer,
+                    output_dir,
+                    params,
+                    strategy=strategy,
+                    temporary=use_temporary,
+                    iface=self.iface,
+                    progress_cb=self._progress_log,
+                    log_cb=self._append_log,
+                )
+            else:
+                from .analysis_raster import RasterAnalysisError, run_raster_analysis
+
+                results = run_raster_analysis(
+                    layer,
+                    output_dir,
+                    params,
+                    strategy=strategy,
+                    temporary=use_temporary,
+                    iface=self.iface,
+                    progress_cb=self._progress_log,
+                )
+
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"Run failed: {exc}", "CRITICAL")
+            self._run_in_progress = False
+            try:
+                if ok_btn is not None:
+                    ok_btn.setEnabled(True)
+            except Exception:
+                pass
+            return
+
+        if results:
+            self._append_log("TerraLink analysis complete.", "INFO")
+            for result in results:
+                stats = result.get("stats", {}) or {}
+                title = stats.get("layer_name", result.get("strategy", strategy))
+                self._append_log(title, "SUMMARY")
+                corridors_created = stats.get("corridors_used")
+                patches_connected = stats.get("patches_connected") or stats.get("patches_merged")
+                budget_used = stats.get("budget_used_display") or stats.get("budget_used")
+                budget_total = stats.get("budget_total_display") or stats.get("budget_total")
+                if corridors_created is not None:
+                    self._append_log(f"  Corridors created: {corridors_created}", "SUMMARY")
+                if patches_connected is not None:
+                    self._append_log(f"  Patches connected: {patches_connected}", "SUMMARY")
+                if budget_used is not None and budget_total is not None:
+                    self._append_log(f"  Budget used: {budget_used}/{budget_total}", "SUMMARY")
+                metrics_path = (stats.get("landscape_metrics_path") or "").strip()
+                if metrics_path:
+                    self._append_log(f"  Landscape metrics: {metrics_path}", "SUMMARY")
+
+        else:
+            self._append_log("No results were produced by the run.", "WARNING")
+
+        # Successful completion: convert Run -> Close to prevent accidental reruns.
+        self._run_completed_successfully = bool(results)
+        self._run_in_progress = False
+        try:
+            if ok_btn is not None:
+                ok_btn.setEnabled(True)
+                if self._run_completed_successfully:
+                    ok_btn.setText("Close")
+        except Exception:
+            pass
+
+        # Keep dialog open so the Log tab remains available.
+        return

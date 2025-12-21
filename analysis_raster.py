@@ -1,5 +1,5 @@
 """
-Linkscape Corridor Analysis - Raster Workflow (v23.0)
+TerraLink Corridor Analysis - Raster Workflow (v23.0)
 -----------------------------------------------------
 Runs the selected raster optimization workflow for corridor analysis.
 
@@ -12,22 +12,53 @@ from __future__ import annotations
 import heapq
 import math
 import os
+import random
 import tempfile
 import time
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
+# NumPy 2.x removed np.int; add shim for legacy references.
+if not hasattr(np, "int"):  # pragma: no cover
+    np.int = int  # type: ignore[attr-defined]
+try:
+    from scipy import ndimage
+
+    HAS_NDIMAGE = True
+except Exception:  # pragma: no cover
+    ndimage = None  # type: ignore
+    HAS_NDIMAGE = False
 try:
     from osgeo import gdal
 except ImportError:  # pragma: no cover
     gdal = None  # type: ignore
 
 try:
-    from qgis.core import QgsProject, QgsRasterLayer
+    from qgis.core import (
+        Qgis,
+        QgsApplication,
+        QgsFeature,
+        QgsField,
+        QgsPalettedRasterRenderer,
+        QgsProject,
+        QgsRasterLayer,
+        QgsUnitTypes,
+        QgsVectorLayer,
+    )
 except ImportError:  # pragma: no cover
+    Qgis = None  # type: ignore
+    QgsApplication = None  # type: ignore
+    QgsFeature = None  # type: ignore
+    QgsField = None  # type: ignore
+    QgsPalettedRasterRenderer = None  # type: ignore
     QgsProject = None  # type: ignore
     QgsRasterLayer = None  # type: ignore
+    QgsVectorLayer = None  # type: ignore
+
+from PyQt5.QtCore import QVariant
+from PyQt5.QtGui import QColor
 
 # Optional OpenCV import for faster connected component labeling
 try:
@@ -37,10 +68,149 @@ try:
 except ImportError:
     HAS_CV2 = False
 
+# Import graph-metrics helper library for entropy/robustness calculations
+try:
+    from . import graph_math
+    import networkx as nx
+
+    HAS_GRAPH_MATH = True
+except ImportError:
+    graph_math = None  # type: ignore
+    nx = None  # type: ignore
+    HAS_GRAPH_MATH = False
+
 GTIFF_OPTIONS = ["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"]
 
 PIXEL_COUNT_WARNING_THRESHOLD = 40_000_000  # warn when raster exceeds ~40 million pixels
 PIXEL_SIZE_WARNING_THRESHOLD = 10.0  # warn when pixel size < 10 map units
+PIXEL_FINE_CRITICAL_COUNT = 2_000_000  # only block fine rasters when they are also large
+
+def _log_message(message: str, level: int = Qgis.Info) -> None:
+    """Log to the QGIS Log Messages Panel with a TerraLink tag."""
+    try:
+        QgsApplication.messageLog().logMessage(message, "TerraLink", level)
+    except Exception:
+        print(f"TerraLink Log: {message}")
+
+
+def _apply_random_unique_value_symbology(layer: "QgsRasterLayer", values: List[int]) -> None:
+    """
+    Apply a paletted renderer with stable pseudo-random colors for integer component ids.
+    """
+    if layer is None or not getattr(layer, "isValid", lambda: False)():
+        return
+    if QgsPalettedRasterRenderer is None:
+        return
+    try:
+        vals = [int(v) for v in values if int(v) > 0]
+    except Exception:
+        return
+    if not vals:
+        return
+    max_classes = 2048
+    if len(vals) > max_classes:
+        vals = vals[:max_classes]
+        try:
+            _log_message(f"[Symbology] Too many components; using first {max_classes} classes.")
+        except Exception:
+            pass
+
+    classes = []
+    try:
+        # Make background transparent.
+        classes.append(QgsPalettedRasterRenderer.Class(0, QColor(0, 0, 0, 0), "NoData"))
+    except Exception:
+        pass
+    for v in vals:
+        # Stable color based on id (so reruns look consistent).
+        hue = int((v * 137) % 360)
+        col = QColor.fromHsv(hue, 200, 255, 255)
+        classes.append(QgsPalettedRasterRenderer.Class(v, col, str(v)))
+
+    try:
+        renderer = QgsPalettedRasterRenderer(layer.dataProvider(), 1, classes)
+        layer.setRenderer(renderer)
+        layer.triggerRepaint()
+    except Exception:
+        return
+
+
+def _apply_random_unique_value_symbology_from_array(layer: "QgsRasterLayer", arr: np.ndarray) -> None:
+    """Apply random unique-value colors for the non-zero unique values present in `arr`."""
+    try:
+        if arr is None or arr.size == 0:
+            return
+        vals = np.unique(arr)
+        vals = [int(v) for v in vals.tolist() if int(v) > 0]
+        _apply_random_unique_value_symbology(layer, vals)
+    except Exception:
+        return
+
+
+def _write_text_report(path: str, lines: List[str]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path) or os.getcwd(), exist_ok=True)
+    except Exception:
+        pass
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines).rstrip() + "\n")
+
+
+def _add_landscape_metrics_table_layer(layer_title: str, analysis_lines: List[str]) -> None:
+    """
+    Add a non-spatial table layer to the QGIS project with the landscape metrics.
+
+    This is a UI-friendly alternative to opening text files or showing popups.
+    """
+    if QgsVectorLayer is None or QgsProject is None or QgsFeature is None or QgsField is None:
+        return
+    try:
+        rows: List[Tuple[str, str, str]] = []
+        in_table = False
+        for line in analysis_lines or []:
+            if (not in_table) and ("METRIC NAME" in line) and ("|" in line):
+                in_table = True
+                continue
+            if not in_table:
+                continue
+            s = (line or "").strip()
+            if not s:
+                continue
+            if s.startswith("="):
+                break
+            if s.startswith("-"):
+                continue
+            if "|" not in s:
+                continue
+            parts = [p.strip() for p in s.split("|")]
+            if len(parts) < 3:
+                continue
+            metric, value, interp = parts[0], parts[1], parts[2]
+            if metric:
+                rows.append((metric, value, interp))
+
+        if not rows:
+            joined = " ".join([l.strip() for l in (analysis_lines or []) if l.strip()])[:240]
+            if not joined:
+                joined = "No landscape metrics available."
+            rows = [("Message", joined, "")]
+
+        uri = "None?field=metric:string(80)&field=value:string(40)&field=interpretation:string(120)"
+        layer = QgsVectorLayer(uri, layer_title, "memory")
+        if not layer.isValid():
+            return
+        provider = layer.dataProvider()
+        feats: List[QgsFeature] = []
+        for metric, value, interp in rows:
+            feat = QgsFeature(layer.fields())
+            feat.setAttributes([metric, value, interp])
+            feats.append(feat)
+        provider.addFeatures(feats)
+        layer.updateExtents()
+        QgsProject.instance().addMapLayer(layer)
+    except Exception:
+        return
+
 
 def _emit_progress(
     progress_cb: Optional[Callable[[int, Optional[str]], None]],
@@ -242,7 +412,7 @@ def define_habitat(data: np.ndarray, nodata_mask: np.ndarray, params: RasterRunP
 
 
 def define_obstacles(data: np.ndarray, nodata_mask: np.ndarray, patch_mask: np.ndarray, params: RasterRunParams) -> np.ndarray:
-    """Create a boolean mask for obstacle pixels corridors must avoid."""
+    """Create a boolean mask for impassable pixels corridors must avoid."""
     if not params.obstacle_enabled:
         return np.zeros(data.shape, dtype=bool)
 
@@ -272,11 +442,167 @@ def find_shortest_corridor(
     connectivity: int,
     obstacle_mask: Optional[np.ndarray] = None,
     passable_mask: Optional[np.ndarray] = None,
-) -> List[Tuple[frozenset, int, float]]:
+    params: Optional[RasterRunParams] = None,
+    target_patch_id: Optional[int] = None,
+    target_boundary_center: Optional[Tuple[int, int]] = None,
+    target_boundary_radius: Optional[int] = None,
+    ghost_pixels: Optional[Set[Tuple[int, int]]] = None,
+    ghost_factor: float = 10.0,
+    start_positions_override: Optional[List[Tuple[int, int]]] = None,
+) -> List[Tuple[frozenset, frozenset, int, float]]:
     """
     Dijkstra search to find shortest corridors connecting start_patches to other patches.
-    Returns a list of (path_pixels, target_patch, length).
+    Returns a list of (path_pixels, habitat_pixels, target_patch, length).
+
+    `habitat_pixels` records any habitat cells (labels==0 but habitat==True) traversed along
+    the chosen path. These are not "corridor cost" pixels, but are used to ensure the
+    contiguous output raster includes connected habitat (e.g., small patches used as bridges).
     """
+    rows, cols = labels.shape
+    SQRT2 = 1.4142135623730951  # Pre-computed math.sqrt(2)
+    if connectivity == 4:
+        moves = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    else:
+        moves = [
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+        ]
+
+    # Convert ghost_pixels set to numpy mask for faster lookup
+    ghost_mask: Optional[np.ndarray] = None
+    if ghost_pixels:
+        ghost_mask = np.zeros((rows, cols), dtype=bool)
+        for gr, gc in ghost_pixels:
+            if 0 <= gr < rows and 0 <= gc < cols:
+                ghost_mask[gr, gc] = True
+
+    start_positions: List[Tuple[int, int]] = start_positions_override or []
+    if not start_positions_override:
+        for i in range(rows):
+            for j in range(cols):
+                if habitat[i, j]:
+                    continue
+                if obstacle_mask is not None and obstacle_mask[i, j]:
+                    continue
+                if passable_mask is not None and not passable_mask[i, j]:
+                    continue
+                for di, dj in moves:
+                    ni, nj = i + di, j + dj
+                    if 0 <= ni < rows and 0 <= nj < cols and labels[ni, nj] in start_patches:
+                        start_positions.append((i, j))
+                        break
+
+    if not start_positions:
+        return []
+
+    heap: List[Tuple[float, int, int]] = []
+    best_cost: Dict[Tuple[int, int], float] = {}
+    parents: Dict[Tuple[int, int], Tuple[Optional[Tuple[int, int]], Optional[str]]] = {}
+    results: List[Tuple[frozenset, frozenset, int, float]] = []
+    visited_targets: Set[int] = set()
+
+    def _reconstruct(state: Tuple[int, int]) -> Tuple[frozenset, frozenset]:
+        path: Set[Tuple[int, int]] = set()
+        habitat_out: Set[Tuple[int, int]] = set()
+        current: Optional[Tuple[int, int]] = state
+        while current is not None:
+            prev, kind = parents.get(current, (None, None))
+            r0, c0 = current
+            if kind == "path":
+                path.add((r0, c0))
+            elif kind == "habitat":
+                habitat_out.add((r0, c0))
+            current = prev
+        return frozenset(path), frozenset(habitat_out)
+
+    for r, c in start_positions:
+        if obstacle_mask is not None and obstacle_mask[r, c]:
+            continue
+        if passable_mask is not None and not passable_mask[r, c]:
+            continue
+        state = (r, c)
+        parents[state] = (None, "path")
+        heapq.heappush(heap, (0.0, r, c))
+        best_cost[state] = 0.0
+
+    nodes_explored = 0
+    t_start = time.perf_counter()
+
+    while heap:
+        cost, r, c = heapq.heappop(heap)
+        state = (r, c)
+        prev_best = best_cost.get(state)
+        if prev_best is not None and cost > prev_best:
+            continue
+        if cost > max_width:
+            continue
+        nodes_explored += 1
+
+        for dr, dc in moves:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                lbl = labels[nr, nc]
+                if lbl > 0 and lbl not in start_patches:
+                    if target_patch_id is not None:
+                        if int(lbl) == int(target_patch_id):
+                            if target_boundary_center is not None and target_boundary_radius is not None:
+                                tr, tc = target_boundary_center
+                                if abs(int(nr) - int(tr)) > int(target_boundary_radius) or abs(int(nc) - int(tc)) > int(target_boundary_radius):
+                                    continue
+                            path_set, habitat_set = _reconstruct(state)
+                            return [(path_set, habitat_set, int(lbl), cost)]
+                    else:
+                        if lbl not in visited_targets:
+                            visited_targets.add(lbl)
+                            path_set, habitat_set = _reconstruct(state)
+                            results.append((path_set, habitat_set, int(lbl), cost))
+                    continue
+
+                if obstacle_mask is not None and obstacle_mask[nr, nc]:
+                    continue
+                if habitat[nr, nc]:
+                    if lbl == 0:
+                        move_cost = 0.0
+                        include_kind = "habitat"  # record connected habitat; no corridor cost
+                    else:
+                        continue
+                else:
+                    if passable_mask is not None and not passable_mask[nr, nc]:
+                        continue
+                    move_cost = SQRT2 if dr != 0 and dc != 0 else 1.0
+                    if ghost_mask is not None and ghost_mask[nr, nc]:
+                        move_cost *= float(ghost_factor)
+                    include_kind = "path"
+                new_cost = cost + move_cost
+                if new_cost > max_width:
+                    continue
+                next_state = (nr, nc)
+                prev_best = best_cost.get(next_state)
+                if prev_best is not None and prev_best <= new_cost:
+                    continue
+                best_cost[next_state] = new_cost
+                parents[next_state] = (state, include_kind)
+                heapq.heappush(heap, (new_cost, nr, nc))
+
+    return results
+
+
+
+def _compute_start_positions_by_patch(
+    labels: np.ndarray,
+    habitat: np.ndarray,
+    connectivity: int,
+    obstacle_mask: Optional[np.ndarray] = None,
+    passable_mask: Optional[np.ndarray] = None,
+    params: Optional[RasterRunParams] = None,
+) -> Dict[int, List[Tuple[int, int]]]:
+    """Precompute Dijkstra start positions for each patch id."""
     rows, cols = labels.shape
     if connectivity == 4:
         moves = [(-1, 0), (1, 0), (0, -1), (0, 1)]
@@ -292,72 +618,212 @@ def find_shortest_corridor(
             (1, 1),
         ]
 
-    start_positions: List[Tuple[int, int]] = []
-    for i in range(rows):
-        for j in range(cols):
-            if obstacle_mask is not None and obstacle_mask[i, j]:
+    by_patch: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+    for r in range(rows):
+        for c in range(cols):
+            if habitat[r, c]:
                 continue
-            if passable_mask is not None and not passable_mask[i, j]:
+            if obstacle_mask is not None and obstacle_mask[r, c]:
                 continue
-            if not habitat[i, j]:
-                for di, dj in moves:
-                    ni, nj = i + di, j + dj
-                    if 0 <= ni < rows and 0 <= nj < cols and labels[ni, nj] in start_patches:
-                        start_positions.append((i, j))
-                        break
+            if passable_mask is not None and not passable_mask[r, c]:
+                continue
 
-    if not start_positions:
+            for dr, dc in moves:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    pid = int(labels[nr, nc])
+                    if pid > 0:
+                        by_patch[pid].append((r, c))
+    return by_patch
+
+
+def _compute_boundary_coords_by_label(labels: np.ndarray, connectivity: int) -> Dict[int, np.ndarray]:
+    """
+    Compute boundary pixel coordinates for each positive label id.
+
+    Boundary pixel = a patch pixel that touches background or a different label
+    under the given connectivity (4 or 8).
+    """
+    rows, cols = labels.shape
+    boundary = np.zeros_like(labels, dtype=bool)
+
+    def _mark_pair(a: np.ndarray, b: np.ndarray, a_view: Tuple[slice, slice], b_view: Tuple[slice, slice]) -> None:
+        mism = a != b
+        if mism.any():
+            boundary[a_view] |= mism & (a > 0)
+            boundary[b_view] |= mism & (b > 0)
+
+    # 4-neighborhood comparisons (mark both sides)
+    _mark_pair(labels[:-1, :], labels[1:, :], (slice(0, rows - 1), slice(0, cols)), (slice(1, rows), slice(0, cols)))
+    _mark_pair(labels[:, :-1], labels[:, 1:], (slice(0, rows), slice(0, cols - 1)), (slice(0, rows), slice(1, cols)))
+
+    if connectivity != 4:
+        # Diagonals
+        _mark_pair(labels[:-1, :-1], labels[1:, 1:], (slice(0, rows - 1), slice(0, cols - 1)), (slice(1, rows), slice(1, cols)))
+        _mark_pair(labels[:-1, 1:], labels[1:, :-1], (slice(0, rows - 1), slice(1, cols)), (slice(1, rows), slice(0, cols - 1)))
+
+    ys, xs = np.nonzero(boundary)
+    if len(ys) == 0:
+        return {}
+    ids = labels[ys, xs].astype(np.int32, copy=False)
+    keep = ids > 0
+    ys = ys[keep]
+    xs = xs[keep]
+    ids = ids[keep]
+    if ids.size == 0:
+        return {}
+
+    order = np.argsort(ids, kind="mergesort")
+    ids_s = ids[order]
+    ys_s = ys[order]
+    xs_s = xs[order]
+
+    out: Dict[int, np.ndarray] = {}
+    unique_ids, starts = np.unique(ids_s, return_index=True)
+    for i, pid in enumerate(unique_ids):
+        start = int(starts[i])
+        end = int(starts[i + 1]) if i + 1 < len(starts) else int(ids_s.size)
+        coords = np.stack([ys_s[start:end], xs_s[start:end]], axis=1).astype(np.int32, copy=False)
+        out[int(pid)] = coords
+    return out
+
+
+def _subsample_coords_grid(
+    coords: np.ndarray,
+    block_size: int,
+    max_points: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Subsample coordinates by keeping at most one point per block in a coarse grid.
+    This preserves local coverage (good for "obvious gaps") without exploding point count.
+    """
+    if coords is None or coords.size == 0:
+        return coords
+    bs = max(1, int(block_size))
+    rr = (coords[:, 0] // bs).astype(np.int64, copy=False)
+    cc = (coords[:, 1] // bs).astype(np.int64, copy=False)
+    keys = (rr << 32) ^ cc
+    _, idx = np.unique(keys, return_index=True)
+    sub = coords[np.sort(idx)]
+    if max_points is not None and sub.shape[0] > int(max_points):
+        stride = max(1, int(sub.shape[0] // int(max_points)))
+        sub = sub[::stride]
+    return sub
+
+
+def _filter_start_positions_near(
+    starts: List[Tuple[int, int]],
+    center: Tuple[int, int],
+    radius: int,
+) -> List[Tuple[int, int]]:
+    if not starts:
         return []
+    cr, cc = int(center[0]), int(center[1])
+    rad = max(1, int(radius))
+    out: List[Tuple[int, int]] = []
+    for r, c in starts:
+        if abs(int(r) - cr) <= rad and abs(int(c) - cc) <= rad:
+            out.append((r, c))
+    return out
 
-    heap: List[Tuple[float, int, int, frozenset]] = []
-    best_cost: Dict[Tuple[int, int], float] = {}
-    results: List[Tuple[frozenset, int, float]] = []
-    visited_targets: Set[int] = set()
-    for r, c in start_positions:
-        if obstacle_mask is not None and obstacle_mask[r, c]:
+
+def _generate_boundary_pair_seeds(
+    labels: np.ndarray,
+    patch_ids: List[int],
+    connectivity: int,
+    max_search_distance: int,
+    min_corridor_width: int,
+    max_seeds_per_pair: int = 8,
+) -> Dict[Tuple[int, int], List[Tuple[Tuple[int, int], Tuple[int, int], float]]]:
+    """
+    Build a "gap-aware" list of nearby patch pairs using boundary pixels and spatial hashing.
+
+    Returns a dict: (p1, p2) -> [(seedA_rc, seedB_rc, euclid_dist_px), ...]
+    """
+    max_d = max(1, int(max_search_distance))
+    max_d2 = float(max_d * max_d)
+
+    # Boundary pixels per patch (then subsample for speed but keep local coverage).
+    t0 = time.perf_counter()
+    boundary_by_pid = _compute_boundary_coords_by_label(labels, connectivity=connectivity)
+    _ = t0  # local timing handled by caller if desired
+
+    # Subsample settings: smaller blocks preserve micro-gaps; cap prevents explosion.
+    block_size = 2
+    cap_per_patch = 2000
+    pts: List[Tuple[int, int, int]] = []
+    for pid in patch_ids:
+        coords = boundary_by_pid.get(int(pid))
+        if coords is None or coords.size == 0:
             continue
-        if passable_mask is not None and not passable_mask[r, c]:
+        sub = _subsample_coords_grid(coords, block_size=block_size, max_points=cap_per_patch)
+        for r, c in sub:
+            pts.append((int(pid), int(r), int(c)))
+    if not pts:
+        return {}
+
+    # Spatial bins
+    bin_size = max(8, min(64, max_d))
+    bins: Dict[Tuple[int, int], List[Tuple[int, int, int]]] = defaultdict(list)
+    for pid, r, c in pts:
+        bins[(r // bin_size, c // bin_size)].append((pid, r, c))
+
+    # Collect closest boundary-to-boundary seeds per pair.
+    # We keep a small candidate list per pair, then enforce spatial diversity later.
+    pair_cands: Dict[Tuple[int, int], List[Tuple[float, Tuple[int, int], Tuple[int, int]]]] = defaultdict(list)
+
+    neighbor_offsets = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1)]
+    for (br, bc), cell_pts in bins.items():
+        # Compare points in this bin to points in neighboring bins.
+        neighbor_pts: List[Tuple[int, int, int]] = []
+        for dr, dc in neighbor_offsets:
+            neighbor_pts.extend(bins.get((br + dr, bc + dc), []))
+        if not neighbor_pts:
             continue
-        path = frozenset({(r, c)})
-        heapq.heappush(heap, (0.0, r, c, path))
-        best_cost[(r, c)] = 0.0
 
-    while heap:
-        cost, r, c, path = heapq.heappop(heap)
-        if cost > max_width:
-            continue
+        for pid1, r1, c1 in cell_pts:
+            for pid2, r2, c2 in neighbor_pts:
+                if pid2 <= pid1:
+                    continue
+                dr = float(r1 - r2)
+                dc = float(c1 - c2)
+                d2 = dr * dr + dc * dc
+                if d2 > max_d2:
+                    continue
+                pk = (pid1, pid2) if pid1 <= pid2 else (pid2, pid1)
+                pair_cands[pk].append((d2, (r1, c1), (r2, c2)))
+                # Soft cap per pair while collecting to keep this step bounded.
+                if len(pair_cands[pk]) > 200:
+                    pair_cands[pk].sort(key=lambda t: t[0])
+                    pair_cands[pk] = pair_cands[pk][:50]
 
-        for dr, dc in moves:
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < rows and 0 <= nc < cols:
-                lbl = labels[nr, nc]
-                if lbl > 0 and lbl not in start_patches and lbl not in visited_targets:
-                    visited_targets.add(lbl)
-                    results.append((path, lbl, cost))
-                    continue
-                if obstacle_mask is not None and obstacle_mask[nr, nc]:
-                    continue
-                if passable_mask is not None and not passable_mask[nr, nc]:
-                    continue
-                if habitat[nr, nc]:
-                    if lbl == 0:
-                        move_cost = 0.0
-                        new_path = path  # do not draw corridors over stepping-stone habitat
-                    else:
-                        continue
-                else:
-                    move_cost = math.sqrt(2) if dr != 0 and dc != 0 else 1.0
-                    new_path = path | frozenset({(nr, nc)})
-                new_cost = cost + move_cost
-                if new_cost > max_width:
-                    continue
-                prev_best = best_cost.get((nr, nc))
-                if prev_best is not None and prev_best <= new_cost:
-                    continue
-                best_cost[(nr, nc)] = new_cost
-                heapq.heappush(heap, (new_cost, nr, nc, new_path))
+    if not pair_cands:
+        return {}
 
-    return results
+    # Enforce "boundary states" diversity: avoid picking seeds that are basically the same spot.
+    # The diversity radius scales with corridor width to avoid adjacent-parallel redundancies.
+    diversity_radius = max(4, int(math.ceil(float(min_corridor_width) * 1.5)))
+    out: Dict[Tuple[int, int], List[Tuple[Tuple[int, int], Tuple[int, int], float]]] = {}
+    for pk, items in pair_cands.items():
+        items.sort(key=lambda t: t[0])
+        chosen: List[Tuple[Tuple[int, int], Tuple[int, int], float]] = []
+        for d2, a, b in items:
+            if len(chosen) >= int(max_seeds_per_pair):
+                break
+            ok = True
+            for a0, b0, _ in chosen:
+                if abs(a[0] - a0[0]) <= diversity_radius and abs(a[1] - a0[1]) <= diversity_radius:
+                    ok = False
+                    break
+                if abs(b[0] - b0[0]) <= diversity_radius and abs(b[1] - b0[1]) <= diversity_radius:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            chosen.append((a, b, float(math.sqrt(d2))))
+        if chosen:
+            out[pk] = chosen
+    return out
 
 
 def find_all_possible_corridors(
@@ -367,283 +833,439 @@ def find_all_possible_corridors(
     max_width: int,
     max_area: Optional[int],
     connectivity: int,
+    min_corridor_width: int,
     obstacle_mask: Optional[np.ndarray] = None,
     passable_mask: Optional[np.ndarray] = None,
+    strategy: str = "circuit_utility",
     progress_cb: Optional[Callable[[int, Optional[str]], None]] = None,
     progress_start: int = 45,
     progress_end: int = 75,
+    params: Optional[RasterRunParams] = None,
+    timing_out: Optional[Dict[str, object]] = None,
 ) -> List[Dict]:
     """Find all possible corridors between patch pairs."""
     print("  Finding all possible corridors...")
+    rows, cols = labels.shape
     all_corridors: List[Dict] = []
     processed_pairs: Set[frozenset] = set()
+    offsets = _corridor_offsets(min_corridor_width)
 
     unique_patches = [p for p in patch_sizes.keys() if p > 0]
     total = len(unique_patches) or 1
     span = max(progress_end - progress_start, 1)
-    for idx, patch_id in enumerate(unique_patches):
-        if (idx + 1) % 10 == 0:
-            print(f"    Analyzing patch {idx + 1}/{len(unique_patches)}...", end="\r")
-        if progress_cb is not None:
-            pre_value = progress_start + ((idx + 0.25) / total) * span
-            _emit_progress(
-                progress_cb,
-                pre_value,
-                f"Analyzing patch {idx + 1}/{total}…",
-            )
 
-        results = find_shortest_corridor(
-            {patch_id},
+    timing_durations: Dict[str, float] = defaultdict(float)
+    timing_counts: Dict[str, int] = defaultdict(int)
+    timing_start = time.perf_counter()
+
+    def _record_timing(label: str, start_s: float) -> None:
+        try:
+            timing_durations[label] += time.perf_counter() - start_s
+            timing_counts[label] += 1
+        except Exception:
+            pass
+
+    strategy_key = (strategy or "circuit_utility").lower()
+    if strategy_key not in ("largest_network", "circuit_utility"):
+        strategy_key = "circuit_utility"
+    circuit_mode = strategy_key == "circuit_utility"
+    # Largest Network mode keeps the fast multi-target search, but adds a targeted micro-gap pass
+    # to catch obvious missed bridges (boundary-aware + gap-aware).
+    micro_gap_mode = strategy_key in ("largest_network",)
+
+    # Circuit mode: keep multiple "boundary-state" variants per pair (no ghosting).
+    max_keep_per_pair = 4 if circuit_mode else 1
+    overlap_keep_ratio = 0.75
+
+    start_positions_by_patch: Dict[int, List[Tuple[int, int, int, bool, bool]]] = {}
+    if circuit_mode or micro_gap_mode:
+        t0 = time.perf_counter()
+        start_positions_by_patch = _compute_start_positions_by_patch(
             labels,
             habitat,
-            max_width,
             connectivity,
             obstacle_mask=obstacle_mask,
             passable_mask=passable_mask,
+            params=params,
         )
-        if not results:
-            continue
+        _record_timing("precompute_start_positions", t0)
 
-        for path_pixels, target_id, path_len in results:
-            pair = frozenset({patch_id, target_id})
-            if pair in processed_pairs:
+    pair_buffers: Dict[Tuple[int, int], List[frozenset]] = defaultdict(list)
+    pair_buffers_expanded: Dict[Tuple[int, int], List[frozenset]] = defaultdict(list)
+    pair_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+
+    # Proximity-aware overlap expansion: treat near-parallel corridors as overlap/thickening.
+    prox_radius = max(1, int(math.ceil(float(min_corridor_width) / 2.0)))
+    expand_offsets = [(dr, dc) for dr in range(-prox_radius, prox_radius + 1) for dc in range(-prox_radius, prox_radius + 1)]
+
+    def _expand_pixels(pixels: Set[Tuple[int, int]]) -> frozenset:
+        expanded: Set[Tuple[int, int]] = set()
+        for r, c in pixels:
+            for dr, dc in expand_offsets:
+                expanded.add((r + dr, c + dc))
+        return frozenset(expanded)
+
+    def _pair_key(a: int, b: int) -> Tuple[int, int]:
+        return (a, b) if a <= b else (b, a)
+
+    def _max_overlap_ratio(new_buf: Set[Tuple[int, int]], prior_expanded: List[frozenset]) -> float:
+        if not new_buf or not prior_expanded:
+            return 0.0
+        denom = float(len(new_buf))
+        if denom <= 0:
+            return 0.0
+        best = 0.0
+        new_f = frozenset(new_buf)
+        for prev in prior_expanded:
+            try:
+                ratio = len(new_f.intersection(prev)) / denom
+            except Exception:
                 continue
-            processed_pairs.add(pair)
+            if ratio > best:
+                best = ratio
+        return best
 
-            if max_area is not None and path_len > max_area:
+    def _add_candidate(
+        p1: int,
+        p2: int,
+        path_pixels: frozenset,
+        habitat_pixels: frozenset,
+        path_len: float,
+        tag: str,
+    ) -> None:
+        if max_area is not None and path_len > max_area:
+            return
+        t0 = time.perf_counter()
+        buffered = _inflate_corridor_pixels(set(path_pixels), offsets, rows, cols, obstacle_mask=obstacle_mask)
+        _record_timing("inflate_pixels", t0)
+        area_px = len(buffered)
+        pk = _pair_key(p1, p2)
+        if circuit_mode:
+            if pair_counts[pk] >= max_keep_per_pair:
+                return
+            t1 = time.perf_counter()
+            overlap = _max_overlap_ratio(buffered, pair_buffers_expanded.get(pk, []))
+            _record_timing("overlap_check", t1)
+            if overlap >= overlap_keep_ratio:
+                return
+        pair_counts[pk] += 1
+        buf_f = frozenset(buffered)
+        pair_buffers[pk].append(buf_f)
+        pair_buffers_expanded[pk].append(_expand_pixels(buffered))
+        all_corridors.append(
+            {
+                "patch1": p1,
+                "patch2": p2,
+                "pixels": path_pixels,
+                "habitat_pixels": habitat_pixels,
+                "length": path_len,
+                "area": area_px,
+                "buffered_pixels": frozenset(buffered),
+                "variant": tag,
+                # Used by Circuit Theory overlap logic to treat near-parallel corridors as overlap.
+                "_prox_radius": int(prox_radius),
+            }
+        )
+
+    if circuit_mode:
+        # ------------------------------------------------------------------
+        # CIRCUIT THEORY: boundary-aware + gap-aware candidate generation
+        #
+        # Instead of "search until you touch any patch", we:
+        #  - build boundary-to-boundary seed pairs for nearby patch pairs
+        #  - run targeted A->B searches (terminate only when reaching B)
+        #  - keep spatially distinct variants; treat near-parallel as overlap
+        # ------------------------------------------------------------------
+        patch_ids = [int(p) for p in unique_patches]
+        t_seed = time.perf_counter()
+        pair_seeds = _generate_boundary_pair_seeds(
+            labels=labels,
+            patch_ids=patch_ids,
+            connectivity=connectivity,
+            max_search_distance=int(max_width),
+            min_corridor_width=int(min_corridor_width),
+            max_seeds_per_pair=8,
+        )
+        _record_timing("pair_seed_build", t_seed)
+        if not pair_seeds:
+            try:
+                _log_message(
+                    "[Circuit] No boundary pair seeds found; falling back to baseline LCP candidate generation.",
+                    Qgis.Warning if Qgis is not None else 1,
+                )
+            except Exception:
+                pass
+
+        if not pair_seeds:
+            # Baseline fallback: old behavior (no ghosting), used only when boundary seeds fail.
+            for idx, patch_id in enumerate(unique_patches):
+                if progress_cb is not None:
+                    pre_value = progress_start + (idx / total) * span
+                    _emit_progress(progress_cb, pre_value, "Analyzing patches")
+
+                start_override = start_positions_by_patch.get(int(patch_id)) if circuit_mode else None
+                t0 = time.perf_counter()
+                results = find_shortest_corridor(
+                    {int(patch_id)},
+                    labels,
+                    habitat,
+                    int(max_width),
+                    connectivity,
+                    obstacle_mask=obstacle_mask,
+                    passable_mask=passable_mask,
+                    params=params,
+                    start_positions_override=start_override,
+                )
+                _record_timing("lcp_search", t0)
+                if not results:
+                    continue
+                for path_pixels, habitat_pixels, target_id, path_len in results:
+                    if int(patch_id) > int(target_id):
+                        continue
+                    _add_candidate(
+                        int(patch_id),
+                        int(target_id),
+                        path_pixels,
+                        habitat_pixels,
+                        path_len,
+                        tag="lcp",
+                    )
+        else:
+            total_tasks = sum(len(v) for v in pair_seeds.values()) or 1
+            done = 0
+
+            # Start filtering radius scales with patch width to force "closest edge" behavior.
+            start_filter_radius = max(6, int(math.ceil(float(min_corridor_width) * 2.0)))
+            target_filter_radius = max(6, int(math.ceil(float(min_corridor_width) * 2.0)))
+
+            for (p1i, p2i), seeds in sorted(pair_seeds.items()):
+                if p1i not in patch_sizes or p2i not in patch_sizes:
+                    continue
+                pk = _pair_key(p1i, p2i)
+                for s_idx, (seed_a, seed_b, _d) in enumerate(seeds, 1):
+                    if pair_counts[pk] >= max_keep_per_pair:
+                        break
+                    if progress_cb is not None:
+                        value = progress_start + (done / total_tasks) * span
+                        _emit_progress(progress_cb, value, "Analyzing patches")
+
+                    start_override = start_positions_by_patch.get(int(p1i), [])
+                    filtered = _filter_start_positions_near(start_override, seed_a, radius=start_filter_radius)
+                    if filtered:
+                        start_override_use = filtered
+                    else:
+                        start_override_use = start_override
+
+                    t0 = time.perf_counter()
+                    res = find_shortest_corridor(
+                        {int(p1i)},
+                        labels,
+                        habitat,
+                        int(max_width),
+                        connectivity,
+                        obstacle_mask=obstacle_mask,
+                        passable_mask=passable_mask,
+                        params=params,
+                        target_patch_id=int(p2i),
+                        target_boundary_center=seed_b,
+                        target_boundary_radius=target_filter_radius,
+                        start_positions_override=start_override_use,
+                    )
+                    _record_timing("target_search", t0)
+                    if (not res) and s_idx == 1 and pair_counts[pk] == 0:
+                        # Fallback for pairs whose "closest boundary" is blocked by obstacles:
+                        # allow reaching the target patch anywhere for at least one baseline candidate.
+                        t_fb = time.perf_counter()
+                        res = find_shortest_corridor(
+                            {int(p1i)},
+                            labels,
+                            habitat,
+                            int(max_width),
+                            connectivity,
+                            obstacle_mask=obstacle_mask,
+                            passable_mask=passable_mask,
+                            params=params,
+                            target_patch_id=int(p2i),
+                            start_positions_override=start_override_use,
+                        )
+                        _record_timing("target_search_fallback", t_fb)
+                    if res:
+                        path_pixels, habitat_pixels, _tid, path_len = res[0]
+                        _add_candidate(
+                            p1i, p2i, path_pixels, habitat_pixels, path_len, tag=f"seed_{s_idx}"
+                        )
+                    done += 1
+
+        _emit_progress(progress_cb, progress_end, "Corridor candidates ready.")
+    else:
+        for idx, patch_id in enumerate(unique_patches):
+            if progress_cb is not None:
+                pre_value = progress_start + (idx / total) * span
+                _emit_progress(
+                    progress_cb,
+                    pre_value,
+                    "Analyzing patches",
+                )
+
+            t0 = time.perf_counter()
+            start_override = start_positions_by_patch.get(int(patch_id)) if micro_gap_mode else None
+            results = find_shortest_corridor(
+                {patch_id},
+                labels,
+                habitat,
+                max_width,
+                connectivity,
+                obstacle_mask=obstacle_mask,
+                passable_mask=passable_mask,
+                params=params,
+                start_positions_override=start_override,
+            )
+            _record_timing("lcp_search", t0)
+            if not results:
                 continue
 
-            all_corridors.append(
-                {
-                    "patch1": patch_id,
-                    "patch2": target_id,
-                    "pixels": path_pixels,
-                    "length": path_len,
-                }
-            )
-        if progress_cb is not None:
-            post_value = progress_start + ((idx + 1) / total) * span
-            _emit_progress(
-                progress_cb,
-                post_value,
-                f"Finished patch {idx + 1}/{total}",
-            )
+            for path_pixels, habitat_pixels, target_id, path_len in results:
+                pair = frozenset({patch_id, target_id})
+                if pair in processed_pairs:
+                    continue
+                processed_pairs.add(pair)
+                _add_candidate(
+                    int(patch_id),
+                    int(target_id),
+                    path_pixels,
+                    habitat_pixels,
+                    path_len,
+                    tag="lcp",
+                )
 
-    _emit_progress(progress_cb, progress_end, "Corridor candidates ready.")
+            if progress_cb is not None:
+                post_value = progress_start + ((idx + 1) / total) * span
+                _emit_progress(progress_cb, post_value, "Analyzing patches")
+
+        # ------------------------------------------------------------------
+        # MICRO-GAP AUGMENTATION (boundary-aware + gap-aware)
+        #
+        # Goal: catch "obvious" near-boundary gaps that the multi-target search
+        # can miss when another patch is touched first.
+        # ------------------------------------------------------------------
+        if micro_gap_mode:
+            try:
+                micro_gap_dist = min(int(max_width), max(12, int(min_corridor_width) * 3))
+                if micro_gap_dist > 0:
+                    patch_ids = [int(p) for p in unique_patches]
+                    t_seed = time.perf_counter()
+                    micro_seeds = _generate_boundary_pair_seeds(
+                        labels=labels,
+                        patch_ids=patch_ids,
+                        connectivity=connectivity,
+                        max_search_distance=int(micro_gap_dist),
+                        min_corridor_width=int(min_corridor_width),
+                        max_seeds_per_pair=2,
+                    )
+                    _record_timing("micro_seed_build", t_seed)
+                    try:
+                        max_micro_pairs_total = 4000
+                        if len(micro_seeds) > max_micro_pairs_total:
+                            items = list(micro_seeds.items())
+                            items.sort(key=lambda kv: float(kv[1][0][2]) if kv[1] else 1e18)
+                            micro_seeds = dict(items[:max_micro_pairs_total])
+                            _log_message(
+                                f"[Micro-gap] Pairs capped to {max_micro_pairs_total} (of {len(items)}) for performance.",
+                                Qgis.Info if Qgis is not None else 0,
+                            )
+                    except Exception:
+                        pass
+
+                    # Nudge progress forward (don't spam patch-level logs).
+                    micro_pairs = len(micro_seeds) or 1
+                    done_pairs = 0
+                    micro_value_start = max(progress_start, min(progress_end - 1, progress_start + int(span * 0.90)))
+                    micro_span = max(1, progress_end - micro_value_start)
+
+                    start_filter_radius = max(6, int(math.ceil(float(min_corridor_width) * 2.0)))
+                    target_filter_radius = max(6, int(math.ceil(float(min_corridor_width) * 2.0)))
+
+                    for (p1i, p2i), seeds in sorted(micro_seeds.items()):
+                        pair_fs = frozenset({int(p1i), int(p2i)})
+                        if pair_fs in processed_pairs:
+                            continue
+                        if p1i not in patch_sizes or p2i not in patch_sizes:
+                            continue
+
+                        if progress_cb is not None:
+                            value = micro_value_start + int((done_pairs / micro_pairs) * micro_span)
+                            _emit_progress(progress_cb, value, "Analyzing patches")
+
+                        best: Optional[Tuple[frozenset, frozenset, float, str]] = None
+                        start_override = start_positions_by_patch.get(int(p1i), [])
+                        for s_idx, (seed_a, seed_b, _d) in enumerate(seeds, 1):
+                            filtered = _filter_start_positions_near(start_override, seed_a, radius=start_filter_radius)
+                            start_override_use = filtered if filtered else start_override
+
+                            t0 = time.perf_counter()
+                            res = find_shortest_corridor(
+                                {int(p1i)},
+                                labels,
+                                habitat,
+                                int(max_width),
+                                connectivity,
+                                obstacle_mask=obstacle_mask,
+                                passable_mask=passable_mask,
+                                params=params,
+                                target_patch_id=int(p2i),
+                                target_boundary_center=seed_b,
+                                target_boundary_radius=target_filter_radius,
+                                start_positions_override=start_override_use,
+                            )
+                            _record_timing("micro_target_search", t0)
+                            if (not res) and s_idx == 1:
+                                # Fallback: allow reaching the target patch anywhere (once).
+                                t_fb = time.perf_counter()
+                                res = find_shortest_corridor(
+                                    {int(p1i)},
+                                    labels,
+                                    habitat,
+                                    int(max_width),
+                                    connectivity,
+                                    obstacle_mask=obstacle_mask,
+                                    passable_mask=passable_mask,
+                                    params=params,
+                                    target_patch_id=int(p2i),
+                                    start_positions_override=start_override_use,
+                                )
+                                _record_timing("micro_target_search_fallback", t_fb)
+
+                            if not res:
+                                continue
+                            path_pixels, habitat_pixels, _tid, path_len = res[0]
+                            tag = f"micro_gap_seed_{s_idx}"
+                            if best is None or float(path_len) < float(best[2]):
+                                best = (path_pixels, habitat_pixels, float(path_len), tag)
+
+                        if best is not None:
+                            path_pixels, habitat_pixels, path_len, tag = best
+                            _add_candidate(
+                                int(p1i),
+                                int(p2i),
+                                path_pixels,
+                                habitat_pixels,
+                                float(path_len),
+                                tag=tag,
+                            )
+                            processed_pairs.add(pair_fs)
+                        done_pairs += 1
+            except Exception:
+                pass
+
+    if not circuit_mode:
+        _emit_progress(progress_cb, progress_end, "Corridor candidates ready.")
     print(f"\n  ✓ Found {len(all_corridors)} possible corridors")
+    timing_durations["total"] = time.perf_counter() - timing_start
+    if timing_out is not None and circuit_mode:
+        timing_out["durations_s"] = dict(timing_durations)
+        timing_out["counts"] = dict(timing_counts)
+        timing_out["candidates"] = len(all_corridors)
     return all_corridors
-
-
-def optimize_most_connectivity(
-    candidates: List[Dict], patch_sizes: Dict[int, int], budget: int
-) -> Tuple[Dict, Dict]:
-    """Strategy 1: Most Connectivity - maximize total connected area."""
-    print("  Strategy: MOST CONNECTIVITY")
-
-    uf = UnionFind()
-    component_area: Dict[int, int] = {}
-    component_active: Dict[int, bool] = {}
-    for pid, size in patch_sizes.items():
-        uf.find(pid)
-        uf.size[pid] = size
-        uf.count[pid] = 1
-        component_area[pid] = size
-        component_active[pid] = False
-
-    selected: Dict[int, Dict] = {}
-    remaining_budget = budget
-    connections_made = 0
-
-    def _marginal_gain(root_a: int, root_b: int) -> int:
-        active_a = component_active.get(root_a, False)
-        active_b = component_active.get(root_b, False)
-        area_a = component_area.get(root_a, 0)
-        area_b = component_area.get(root_b, 0)
-        if not active_a and not active_b:
-            return area_a + area_b
-        if active_a and active_b:
-            return 0
-        return area_b if active_a else area_a
-
-    while remaining_budget > 0:
-        best_candidate: Optional[Dict] = None
-        best_efficiency = 0.0
-        best_gain = 0
-
-        for cand in candidates:
-            cost = cand["length"]
-            if cost > remaining_budget:
-                continue
-            p1, p2 = cand["patch1"], cand["patch2"]
-            root1, root2 = uf.find(p1), uf.find(p2)
-            if root1 == root2:
-                continue
-            gain = _marginal_gain(root1, root2)
-            if gain <= 0:
-                continue
-            efficiency = gain / cost if cost > 0 else float("inf")
-            if (
-                best_candidate is None
-                or efficiency > best_efficiency
-                or (efficiency == best_efficiency and gain > best_gain)
-            ):
-                best_candidate = cand
-                best_efficiency = efficiency
-                best_gain = gain
-
-        if best_candidate is None:
-            break
-
-        cost = best_candidate["length"]
-        p1, p2 = best_candidate["patch1"], best_candidate["patch2"]
-        root1, root2 = uf.find(p1), uf.find(p2)
-        area1 = component_area.get(root1, patch_sizes.get(p1, 0))
-        area2 = component_area.get(root2, patch_sizes.get(p2, 0))
-
-        new_root = uf.union(p1, p2)
-        uf.size[new_root] += cost
-        component_area[new_root] = area1 + area2
-        component_active[new_root] = True
-        if new_root != root1:
-            component_area.pop(root1, None)
-            component_active.pop(root1, None)
-        if new_root != root2:
-            component_area.pop(root2, None)
-            component_active.pop(root2, None)
-
-        connections_made += 1
-        remaining_budget -= cost
-        selected[len(selected) + 1] = {
-            "pixels": best_candidate["pixels"],
-            "patch_ids": {p1, p2},
-            "length": cost,
-            "connected_size": uf.get_size(new_root),
-        }
-
-    active_roots = [root for root, active in component_active.items() if active]
-    root_sizes: Dict[int, int] = {root: uf.get_size(root) for root in active_roots}
-    root_counts: Dict[int, int] = {root: uf.get_count(root) for root in active_roots}
-
-    return selected, {
-        "strategy": "most_connectivity",
-        "corridors_used": len(selected),
-        "connections_made": connections_made,
-        "budget_used": budget - remaining_budget,
-        "total_connected_size": sum(root_sizes.values()),
-        "groups_created": len(root_sizes),
-        "largest_group_size": max(root_sizes.values()) if root_sizes else 0,
-        "largest_group_patches": max(root_counts.values()) if root_counts else 0,
-        "patches_connected": sum(root_counts.values()),
-    }
-
-
-def optimize_largest_patch(
-    candidates: List[Dict], patch_sizes: Dict[int, int], budget: int
-) -> Tuple[Dict, Dict]:
-    """Strategy 3: Largest Patch - expand the largest component via priority queue."""
-    print("  Strategy: LARGEST PATCH (priority growth)")
-    if not candidates:
-        return {}, {"strategy": "largest_patch", "corridors_used": 0}
-
-    adjacency: Dict[int, List[Dict]] = {}
-    for cand in candidates:
-        adjacency.setdefault(cand["patch1"], []).append(cand)
-        adjacency.setdefault(cand["patch2"], []).append(cand)
-
-    sorted_patch_ids = sorted(patch_sizes.keys(), key=lambda k: patch_sizes[k], reverse=True)
-
-    print(f"  Testing {min(20, len(sorted_patch_ids))} seed patches...")
-    best_result = {"corridors": {}, "final_size": 0, "seed_id": None, "budget_used": 0}
-
-    for i, seed_id in enumerate(sorted_patch_ids[:20]):
-        if (i + 1) % 5 == 0:
-            print(f"    Seed {i + 1}/20...", end="\r")
-
-        component: Set[int] = {seed_id}
-        component_size = patch_sizes.get(seed_id, 0)
-        remaining_budget = float(budget)
-        sim_corridors: Dict[int, Dict] = {}
-        counter = 0
-        pq: List[Tuple[float, float, int, Dict]] = []
-
-        def enqueue_neighbors(patch_id: int) -> None:
-            nonlocal counter, component_size
-            for cand in adjacency.get(patch_id, []):
-                p1, p2 = cand["patch1"], cand["patch2"]
-                if p1 in component and p2 in component:
-                    continue
-                if p1 == patch_id and p2 not in component:
-                    target = p2
-                elif p2 == patch_id and p1 not in component:
-                    target = p1
-                else:
-                    continue
-                potential_size = component_size + patch_sizes.get(target, 0) + cand["length"]
-                heapq.heappush(pq, (-potential_size, cand["length"], counter, cand))
-                counter += 1
-
-        enqueue_neighbors(seed_id)
-
-        while pq and remaining_budget > 0:
-            neg_potential, cost, _, cand = heapq.heappop(pq)
-            p1, p2 = cand["patch1"], cand["patch2"]
-            if p1 in component and p2 in component:
-                continue
-            if p1 in component:
-                target = p2
-            elif p2 in component:
-                target = p1
-            else:
-                continue
-            if target in component:
-                continue
-            if cost > remaining_budget:
-                continue
-
-            remaining_budget -= cost
-            component.add(target)
-            component_size += patch_sizes.get(target, 0) + cost
-            sim_corridors[len(sim_corridors) + 1] = {
-                "pixels": cand["pixels"],
-                "patch_ids": {p1, p2},
-                "length": cost,
-                "connected_size": component_size,
-            }
-            enqueue_neighbors(target)
-
-        if component_size > best_result["final_size"]:
-            best_result = {
-                "corridors": sim_corridors,
-                "final_size": component_size,
-                "seed_id": seed_id,
-                "budget_used": budget - remaining_budget,
-                "patch_count": len(component),
-            }
-
-    print(f"\n  ✓ Best: Patch {best_result['seed_id']} -> {best_result['final_size']:,} px")
-
-    if not best_result["corridors"]:
-        return {}, {"strategy": "largest_patch", "corridors_used": 0}
-
-    selected: Dict[int, Dict] = {}
-    for i, corr in best_result["corridors"].items():
-        selected[i] = {
-            "pixels": corr["pixels"],
-            "patch_ids": corr["patch_ids"],
-            "length": corr["length"],
-            "connected_size": best_result["final_size"],
-        }
-
-    return selected, {
-        "strategy": "largest_patch",
-        "seed_id": best_result["seed_id"],
-        "final_patch_size": best_result["final_size"],
-        "corridors_used": len(selected),
-        "budget_used": best_result["budget_used"],
-        "groups_created": 1,
-        "patches_connected": best_result.get("patch_count", len(selected) + 1),
-        "largest_group_size": best_result["final_size"],
-    }
 
 
 def _corridor_offsets(min_corridor_width: int) -> List[Tuple[int, int]]:
@@ -665,6 +1287,27 @@ def _corridor_offsets(min_corridor_width: int) -> List[Tuple[int, int]]:
     if not offsets:
         offsets.append((0, 0))
     return offsets
+
+
+def _inflate_corridor_pixels(
+    pixels: Set[Tuple[int, int]],
+    offsets: List[Tuple[int, int]],
+    rows: int,
+    cols: int,
+    obstacle_mask: Optional[np.ndarray] = None,
+) -> Set[Tuple[int, int]]:
+    """Apply offsets to centerline pixels, respecting impassables when provided."""
+    inflated: Set[Tuple[int, int]] = set()
+    use_mask = obstacle_mask is not None
+
+    for r, c in pixels:
+        for dr, dc in offsets:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                if use_mask and obstacle_mask[nr, nc]:
+                    continue
+                inflated.add((nr, nc))
+    return inflated
 
 
 def _shift_mask(mask: np.ndarray, dr: int, dc: int) -> np.ndarray:
@@ -721,14 +1364,16 @@ def _build_passable_mask(
     base_passable = (~habitat_bool) & (~obstacle_bool)
 
     if allow_bottlenecks or min_corridor_width <= 1:
-        return base_passable
+        passable = base_passable
+    else:
+        offsets = _corridor_offsets(min_corridor_width)
+        # Ignore habitat when evaluating clearance so corridors can still touch patches.
+        true_obstacles = obstacle_bool & (~habitat_bool)
+        clearance_space = ~true_obstacles
+        clearance_ok = _erode_mask(clearance_space, offsets)
+        passable = base_passable & clearance_ok
 
-    offsets = _corridor_offsets(min_corridor_width)
-    # Ignore habitat when evaluating clearance so corridors can still touch patches.
-    true_obstacles = obstacle_bool & (~habitat_bool)
-    clearance_space = ~true_obstacles
-    clearance_ok = _erode_mask(clearance_space, offsets)
-    return base_passable & clearance_ok
+    return passable
 
 
 def create_output_raster(
@@ -756,6 +1401,749 @@ def create_output_raster(
     return output
 
 
+def create_combined_raster(
+    labels: np.ndarray,
+    corridors: Dict[int, Dict],
+    min_corridor_width: int,
+    obstacle_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Create a raster where habitat patches and corridors are merged and labeled by connectivity."""
+    rows, cols = labels.shape
+    use_mask = obstacle_mask is not None
+    combined = np.zeros_like(labels, dtype=np.int32)
+
+    # Start with patches (existing labels)
+    combined = labels.copy().astype(np.int32)
+
+    # Burn corridors as a unique label (negative), then re-label components
+    offsets = _corridor_offsets(min_corridor_width)
+    next_label = int(labels.max()) + 1
+    corridor_mask = np.zeros_like(labels, dtype=bool)
+    for corridor_data in corridors.values():
+        for r, c in corridor_data["pixels"]:
+            for dr, dc in offsets:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    if use_mask and obstacle_mask is not None and obstacle_mask[nr, nc]:
+                        continue
+                    corridor_mask[nr, nc] = True
+
+    combined[corridor_mask] = -1  # temporary mark corridors
+
+    if HAS_NDIMAGE and ndimage is not None:
+        habitat_corr = combined != 0
+        structure = np.ones((3, 3), dtype=np.uint8)
+        labeled, _ = ndimage.label(habitat_corr, structure=structure)
+        labeled[combined == 0] = 0
+        return labeled.astype(np.int32)
+
+    # Fallback: return patches with corridor mask burned as a unique label
+    combined[corridor_mask] = labels.max() + 1 if labels.size > 0 else 1
+    return combined.astype(np.int32)
+
+
+def create_contiguous_network_area_raster(
+    labels: np.ndarray,
+    corridors: Dict[int, Dict],
+    min_corridor_width: int,
+    obstacle_mask: Optional[np.ndarray] = None,
+    labels_all: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Build a raster where every habitat/corridor cell value equals the total area (pixels)
+    of its connected component.
+
+    This includes all habitat patches in `labels` (even if not part of the corridor network).
+
+    Additionally, corridor pathfinding may traverse habitat pixels that are not in `labels`
+    (e.g., small filtered-out patches); if `labels_all` is provided and a traversed habitat
+    pixel belongs to a filtered-out patch in `labels_all`, the entire patch footprint is
+    included in the component before computing its area.
+    """
+    rows, cols = labels.shape
+    if rows == 0 or cols == 0:
+        return labels.astype(np.int32)
+
+    patch_ids = np.unique(labels[labels > 0]).astype(int)
+    if patch_ids.size == 0:
+        return np.zeros_like(labels, dtype=np.int32)
+
+    uf = UnionFind()
+    for pid in patch_ids.tolist():
+        uf.find(int(pid))
+    for corr in corridors.values():
+        pids = list(corr.get("patch_ids", []))
+        if len(pids) >= 2:
+            uf.union(int(pids[0]), int(pids[1]))
+
+    root_to_idx: Dict[int, int] = {}
+    next_idx = 1
+    for pid in patch_ids.tolist():
+        root = int(uf.find(int(pid)))
+        if root not in root_to_idx:
+            root_to_idx[root] = next_idx
+            next_idx += 1
+
+    max_label = int(labels.max())
+    lookup = np.zeros(max_label + 1, dtype=np.int32)
+    for pid in patch_ids.tolist():
+        lookup[int(pid)] = root_to_idx[int(uf.find(int(pid)))]
+
+    network_labels = lookup[labels.astype(np.int32)]
+
+    offsets = _corridor_offsets(min_corridor_width)
+    use_mask = obstacle_mask is not None
+    for corr in corridors.values():
+        pids = list(corr.get("patch_ids", []))
+        if len(pids) < 1:
+            continue
+        comp_idx = root_to_idx.get(int(uf.find(int(pids[0]))))
+        if comp_idx is None:
+            continue
+        for r, c in corr.get("pixels", frozenset()):
+            for dr, dc in offsets:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    if use_mask and obstacle_mask is not None and obstacle_mask[nr, nc]:
+                        continue
+                    network_labels[nr, nc] = comp_idx
+
+        # Include connected habitat pixels used by the corridor path.
+        # This ensures small "bridge" patches are present in the contiguous output.
+        touched_old_ids: Set[int] = set()
+        for r, c in corr.get("habitat_pixels", frozenset()) or frozenset():
+            if 0 <= r < rows and 0 <= c < cols:
+                if use_mask and obstacle_mask is not None and obstacle_mask[r, c]:
+                    continue
+                network_labels[r, c] = comp_idx
+                if labels_all is not None:
+                    try:
+                        if int(labels[r, c]) == 0:
+                            old_id = int(labels_all[r, c])
+                            if old_id > 0:
+                                touched_old_ids.add(old_id)
+                    except Exception:
+                        pass
+
+        if labels_all is not None and touched_old_ids:
+            for old_id in touched_old_ids:
+                try:
+                    mask = (labels_all == int(old_id)) & (labels == 0)
+                    network_labels[mask] = comp_idx
+                except Exception:
+                    continue
+
+    # Convert component ids -> component areas in pixels (per your requested semantics).
+    counts = np.bincount(network_labels.ravel())
+    out = counts[network_labels]
+    out[network_labels == 0] = 0
+    return out.astype(np.int32)
+
+
+def _compute_connectivity_metrics(corridors: Dict[int, Dict], patch_sizes: Dict[int, int]) -> Dict[str, float]:
+    """Compute consistent graph metrics for summaries across strategies."""
+    n_nodes = len(patch_sizes)
+    uf = UnionFind()
+    for pid in patch_sizes:
+        uf.find(pid)
+
+    edges_used = len(corridors)
+    for data in corridors.values():
+        p1 = data.get("p1") or data.get("patch1")
+        p2 = data.get("p2") or data.get("patch2")
+        if p1 is not None and p2 is not None:
+            uf.union(int(p1), int(p2))
+        else:
+            pids = list(data.get("patch_ids", []))
+            if len(pids) >= 2:
+                uf.union(int(pids[0]), int(pids[1]))
+
+    components = len({uf.find(pid) for pid in patch_sizes})
+    redundant_links = max(0, edges_used - (n_nodes - components))
+    avg_degree = (2 * edges_used / n_nodes) if n_nodes > 0 else 0.0
+
+    return {
+        "patches_total": n_nodes,
+        "edges_used": edges_used,
+        "components_remaining": components,
+        "redundant_links": redundant_links,
+        "avg_degree": avg_degree,
+    }
+def _build_corridor_stats(
+    selected: Dict[int, Dict],
+    patch_sizes: Dict[int, int],
+) -> Tuple[Dict[int, int], Dict[int, int]]:
+    """Compute component sizes and counts for selected corridors."""
+    uf = UnionFind()
+    for pid, size in patch_sizes.items():
+        uf.find(pid)
+        uf.size[pid] = size
+        uf.count[pid] = 1
+
+    for corr in selected.values():
+        pids = list(corr.get("patch_ids", []))
+        if len(pids) >= 2:
+            uf.union(int(pids[0]), int(pids[1]))
+
+    comp_sizes: Dict[int, int] = {}
+    comp_counts: Dict[int, int] = {}
+    for pid in patch_sizes.keys():
+        root = uf.find(pid)
+        comp_sizes[root] = comp_sizes.get(root, 0) + patch_sizes.get(pid, 0)
+        comp_counts[root] = comp_counts.get(root, 0) + 1
+
+    return comp_sizes, comp_counts
+
+
+def optimize_resilient(
+    candidates: List[Dict], patch_sizes: Dict[int, int], budget_pixels: int
+) -> Tuple[Dict[int, Dict], Dict]:
+    """
+    Lightweight resilient strategy: MST-style on corridor cost within budget.
+    """
+    uf = UnionFind()
+    for pid, size in patch_sizes.items():
+        uf.find(pid)
+        uf.size[pid] = size
+        uf.count[pid] = 1
+
+    selected: Dict[int, Dict] = {}
+    remaining = max(0, int(budget_pixels))
+    budget_used = 0
+    redundant_links = 0
+    backbone_edges: List[Tuple[int, int, float]] = []
+
+    for cand in sorted(candidates, key=lambda c: c.get("area", 0)):
+        p1, p2 = cand.get("patch1"), cand.get("patch2")
+        if p1 is None or p2 is None:
+            continue
+        cost = int(cand.get("area", 0))
+        if cost <= 0 or cost > remaining:
+            continue
+        if uf.find(p1) == uf.find(p2):
+            continue
+
+        uf.union(p1, p2)
+        remaining -= cost
+        budget_used += cost
+        comp_root = uf.find(p1)
+        conn_size = uf.size.get(comp_root, cost)
+        backbone_edges.append((int(p1), int(p2), float(cand.get("length", cost) or cost)))
+
+        cid = len(selected) + 1
+        selected[cid] = {
+            "pixels": cand.get("pixels", set()),
+            "habitat_pixels": cand.get("habitat_pixels", frozenset()),
+            "patch_ids": {p1, p2},
+            "area": cost,
+            "connected_size": conn_size,
+            "type": "backbone",
+        }
+
+    if remaining > 0 and selected:
+        loop_candidates: List[Tuple[float, Dict]] = []
+        selected_pairs = {tuple(sorted(map(int, c.get("patch_ids", [])))) for c in selected.values()}
+
+        if nx is not None and graph_math is not None:
+            G_backbone = nx.Graph()
+            for pid in patch_sizes:
+                G_backbone.add_node(int(pid))
+            for a, b, w in backbone_edges:
+                G_backbone.add_edge(int(a), int(b), weight=float(w))
+
+            for cand in candidates:
+                p1, p2 = cand.get("patch1"), cand.get("patch2")
+                if p1 is None or p2 is None:
+                    continue
+                p1i, p2i = int(p1), int(p2)
+                if uf.find(p1i) != uf.find(p2i):
+                    continue
+                pair = tuple(sorted((p1i, p2i)))
+                if pair in selected_pairs:
+                    continue
+                cost = int(cand.get("area", 0))
+                if cost <= 0 or cost > remaining:
+                    continue
+                length = float(cand.get("length", 0) or 0.0)
+                if length <= 0:
+                    length = float(cost)
+                try:
+                    score = float(graph_math.score_edge_for_loops(G_backbone, p1i, p2i, length))
+                except Exception:
+                    score = 0.0
+                efficiency = score / float(cost) if cost else 0.0
+                loop_candidates.append((efficiency, cand))
+
+            loop_candidates.sort(key=lambda t: t[0], reverse=True)
+
+            for _eff, cand in loop_candidates:
+                cost = int(cand.get("area", 0))
+                if cost <= 0 or cost > remaining:
+                    continue
+                p1, p2 = int(cand.get("patch1")), int(cand.get("patch2"))
+                pair = tuple(sorted((p1, p2)))
+                if pair in selected_pairs:
+                    continue
+                remaining -= cost
+                budget_used += cost
+                redundant_links += 1
+                selected_pairs.add(pair)
+                length = float(cand.get("length", 0) or 0.0)
+                if length <= 0:
+                    length = float(cost)
+                try:
+                    G_backbone.add_edge(p1, p2, weight=length)
+                except Exception:
+                    pass
+
+                cid = len(selected) + 1
+                selected[cid] = {
+                    "pixels": cand.get("pixels", set()),
+                    "habitat_pixels": cand.get("habitat_pixels", frozenset()),
+                    "patch_ids": {p1, p2},
+                    "area": cost,
+                    "connected_size": uf.size.get(uf.find(p1), cost),
+                    "type": "strategic_loop",
+                }
+        else:
+            for cand in sorted(candidates, key=lambda c: c.get("area", 0)):
+                if remaining <= 0:
+                    break
+                p1, p2 = cand.get("patch1"), cand.get("patch2")
+                if p1 is None or p2 is None:
+                    continue
+                if uf.find(p1) != uf.find(p2):
+                    continue
+                pair = tuple(sorted((int(p1), int(p2))))
+                if pair in selected_pairs:
+                    continue
+                cost = int(cand.get("area", 0))
+                if cost <= 0 or cost > remaining:
+                    continue
+                remaining -= cost
+                budget_used += cost
+                redundant_links += 1
+                selected_pairs.add(pair)
+                cid = len(selected) + 1
+                selected[cid] = {
+                    "pixels": cand.get("pixels", set()),
+                    "habitat_pixels": cand.get("habitat_pixels", frozenset()),
+                    "patch_ids": {p1, p2},
+                    "area": cost,
+                    "connected_size": uf.size.get(uf.find(p1), cost),
+                    "type": "redundant",
+                }
+
+    comp_sizes, comp_counts = _build_corridor_stats(selected, patch_sizes)
+    largest_group_size = max(comp_sizes.values()) if comp_sizes else 0
+    largest_group_patches = max(comp_counts.values()) if comp_counts else 0
+
+    stats = {
+        "strategy": "largest_network",
+        "corridors_used": len(selected),
+        "budget_used": budget_used,
+        "budget_total": budget_pixels,
+        "patches_total": len(patch_sizes),
+        "patches_connected": len(patch_sizes),
+        "components_remaining": len(comp_sizes) if comp_sizes else len(patch_sizes),
+        "largest_group_size": largest_group_size,
+        "largest_group_patches": largest_group_patches,
+        "total_connected_size": sum(comp_sizes.values()) if comp_sizes else 0,
+        "redundant_links": redundant_links,
+        "avg_degree": (2 * len(selected) / max(len(patch_sizes), 1)) if patch_sizes else 0,
+    }
+    return selected, stats
+
+
+def optimize_largest_network(
+    candidates: List[Dict], patch_sizes: Dict[int, int], budget_pixels: int
+) -> Tuple[Dict[int, Dict], Dict]:
+    """
+    Grow corridors outward from the largest patch, preferring highest gain per cost.
+
+    This is intentionally different from MST-by-cost: it prioritizes "micro-gaps" that
+    add a large patch/component to the growing network, instead of spending budget on
+    very cheap links to tiny patches.
+    """
+    if not patch_sizes:
+        return {}, {}
+    seed = max(patch_sizes.items(), key=lambda kv: kv[1])[0]
+    visited: Set[int] = {seed}
+    visited_size = int(patch_sizes.get(int(seed), 0) or 0)
+    remaining = max(0, int(budget_pixels))
+    budget_used = 0
+    selected: Dict[int, Dict] = {}
+    redundant_links = 0
+    backbone_edges: List[Tuple[int, int, float]] = []
+
+    adjacency: Dict[int, List[Dict]] = defaultdict(list)
+    for cand in candidates:
+        adjacency[cand.get("patch1")].append(cand)
+        adjacency[cand.get("patch2")].append(cand)
+
+    # Heap entry: (-roi, -gain, cost, counter, cand)
+    heap: List[Tuple[float, int, int, int, Dict]] = []
+    counter = 0
+    for cand in adjacency.get(seed, []):
+        cost = int(cand.get("area", 0) or 0)
+        if cost <= 0:
+            continue
+        p1, p2 = cand.get("patch1"), cand.get("patch2")
+        if p1 is None or p2 is None:
+            continue
+        in1, in2 = p1 in visited, p2 in visited
+        if not (in1 ^ in2):
+            continue
+        new_node = int(p2) if in1 else int(p1)
+        gain = int(patch_sizes.get(new_node, 0) or 0)
+        if gain <= 0:
+            continue
+        roi = gain / float(cost)
+        counter += 1
+        heapq.heappush(heap, (-roi, -gain, cost, counter, cand))
+
+    while heap and remaining > 0:
+        _neg_roi, _neg_gain, cost, _, cand = heapq.heappop(heap)
+        if cost <= 0 or cost > remaining:
+            continue
+        p1, p2 = cand.get("patch1"), cand.get("patch2")
+        in1, in2 = p1 in visited, p2 in visited
+        if in1 and in2:
+            continue
+        if not in1 and not in2:
+            continue
+
+        new_node = int(p2) if in1 else int(p1)
+        if new_node in visited:
+            continue
+        gain = int(patch_sizes.get(int(new_node), 0) or 0)
+        if gain <= 0:
+            continue
+        visited.add(new_node)
+        visited_size += gain
+        remaining -= cost
+        budget_used += cost
+        comp_size = visited_size
+        backbone_edges.append((int(p1), int(p2), float(cand.get("length", cost) or cost)))
+
+        cid = len(selected) + 1
+        selected[cid] = {
+            "pixels": cand.get("pixels", set()),
+            "habitat_pixels": cand.get("habitat_pixels", frozenset()),
+            "patch_ids": {p1, p2},
+            "area": cost,
+            "connected_size": comp_size,
+            "type": "backbone",
+        }
+
+        for nxt in adjacency.get(new_node, []):
+            n1, n2 = nxt.get("patch1"), nxt.get("patch2")
+            if n1 is None or n2 is None:
+                continue
+            touches = (n1 in visited) ^ (n2 in visited)
+            if not touches:
+                continue
+            cost2 = int(nxt.get("area", 0) or 0)
+            if cost2 <= 0:
+                continue
+            new2 = int(n2) if (n1 in visited) else int(n1)
+            if new2 in visited:
+                continue
+            gain2 = int(patch_sizes.get(new2, 0) or 0)
+            if gain2 <= 0:
+                continue
+            roi2 = gain2 / float(cost2)
+            counter += 1
+            heapq.heappush(heap, (-roi2, -gain2, cost2, counter, nxt))
+
+    if remaining > 0 and selected and visited:
+        selected_pairs = {tuple(sorted(map(int, c.get("patch_ids", [])))) for c in selected.values()}
+
+        if nx is not None and graph_math is not None:
+            G_backbone = nx.Graph()
+            for pid in visited:
+                G_backbone.add_node(int(pid))
+            for a, b, w in backbone_edges:
+                if int(a) in visited and int(b) in visited:
+                    G_backbone.add_edge(int(a), int(b), weight=float(w))
+
+            loop_candidates: List[Tuple[float, Dict]] = []
+            for cand in candidates:
+                p1, p2 = cand.get("patch1"), cand.get("patch2")
+                if p1 is None or p2 is None:
+                    continue
+                p1i, p2i = int(p1), int(p2)
+                if p1i not in visited or p2i not in visited:
+                    continue
+                pair = tuple(sorted((p1i, p2i)))
+                if pair in selected_pairs:
+                    continue
+                cost = int(cand.get("area", 0))
+                if cost <= 0 or cost > remaining:
+                    continue
+                length = float(cand.get("length", 0) or 0.0)
+                if length <= 0:
+                    length = float(cost)
+                try:
+                    if not nx.has_path(G_backbone, p1i, p2i):
+                        continue
+                    score = float(graph_math.score_edge_for_loops(G_backbone, p1i, p2i, length))
+                except Exception:
+                    continue
+                efficiency = score / float(cost) if cost else 0.0
+                loop_candidates.append((efficiency, cand))
+
+            loop_candidates.sort(key=lambda t: t[0], reverse=True)
+            for _eff, cand in loop_candidates:
+                cost = int(cand.get("area", 0))
+                if cost <= 0 or cost > remaining:
+                    continue
+                p1, p2 = int(cand.get("patch1")), int(cand.get("patch2"))
+                pair = tuple(sorted((p1, p2)))
+                if pair in selected_pairs:
+                    continue
+                remaining -= cost
+                budget_used += cost
+                redundant_links += 1
+                selected_pairs.add(pair)
+                length = float(cand.get("length", 0) or 0.0)
+                if length <= 0:
+                    length = float(cost)
+                try:
+                    G_backbone.add_edge(p1, p2, weight=length)
+                except Exception:
+                    pass
+
+                cid = len(selected) + 1
+                selected[cid] = {
+                    "pixels": cand.get("pixels", set()),
+                    "habitat_pixels": cand.get("habitat_pixels", frozenset()),
+                    "patch_ids": {p1, p2},
+                    "area": cost,
+                    "connected_size": visited_size,
+                    "type": "strategic_loop",
+                }
+        else:
+            for cand in sorted(candidates, key=lambda c: c.get("area", 0)):
+                if remaining <= 0:
+                    break
+                p1, p2 = cand.get("patch1"), cand.get("patch2")
+                if p1 is None or p2 is None:
+                    continue
+                if int(p1) not in visited or int(p2) not in visited:
+                    continue
+                pair = tuple(sorted((int(p1), int(p2))))
+                if pair in selected_pairs:
+                    continue
+                cost = int(cand.get("area", 0))
+                if cost <= 0 or cost > remaining:
+                    continue
+                remaining -= cost
+                budget_used += cost
+                redundant_links += 1
+                selected_pairs.add(pair)
+                cid = len(selected) + 1
+                selected[cid] = {
+                    "pixels": cand.get("pixels", set()),
+                    "habitat_pixels": cand.get("habitat_pixels", frozenset()),
+                    "patch_ids": {p1, p2},
+                    "area": cost,
+                    "connected_size": visited_size,
+                    "type": "redundant",
+                }
+
+    comp_sizes, comp_counts = _build_corridor_stats(selected, patch_sizes)
+    largest_group_size = max(comp_sizes.values()) if comp_sizes else 0
+    largest_group_patches = max(comp_counts.values()) if comp_counts else 0
+
+    stats = {
+        "strategy": "largest_network",
+        "corridors_used": len(selected),
+        "budget_used": budget_used,
+        "budget_total": budget_pixels,
+        "patches_total": len(patch_sizes),
+        "patches_connected": len(visited),
+        "components_remaining": len(comp_sizes) if comp_sizes else len(patch_sizes),
+        "largest_group_size": largest_group_size,
+        "largest_group_patches": largest_group_patches,
+        "total_connected_size": sum(comp_sizes.values()) if comp_sizes else 0,
+        "redundant_links": redundant_links,
+        "avg_degree": (2 * len(selected) / max(len(patch_sizes), 1)) if patch_sizes else 0,
+    }
+    return selected, stats
+
+
+def optimize_circuit_utility(
+    candidates: List[Dict],
+    patch_sizes: Dict[int, int],
+    budget_pixels: int,
+    overlap_reject_ratio: float = 0.30,
+) -> Tuple[Dict[int, Dict], Dict]:
+    """
+    Circuit Theory (Utility) strategy for raster candidates.
+
+    Uses a weighted greedy loop over corridor candidates:
+      score = (sqrt(size_p1 * size_p2) / cost) * multiplier
+
+    multiplier:
+      1.0  if candidate connects different components
+      0.5  if already connected but spatially distinct
+      0.01 if overlaps existing corridor for the pair by > overlap_reject_ratio
+    """
+
+    from .core_select import select_circuit_utility
+
+    def _pair_key(a: int, b: int) -> Tuple[int, int]:
+        return (a, b) if a <= b else (b, a)
+
+    # Proximity-aware expansion: treat "parallel adjacent" corridors as overlap too.
+    prox_radius = 1
+    try:
+        for cand in candidates:
+            pr = int(cand.get("_prox_radius", 0) or 0)
+            if pr > prox_radius:
+                prox_radius = pr
+    except Exception:
+        prox_radius = 1
+    prox_radius = max(1, int(prox_radius))
+    expand_offsets = [(dr, dc) for dr in range(-prox_radius, prox_radius + 1) for dc in range(-prox_radius, prox_radius + 1)]
+
+    def _expand_pixels(pixels: frozenset) -> frozenset:
+        expanded: Set[Tuple[int, int]] = set()
+        for r, c in pixels:
+            for dr, dc in expand_offsets:
+                expanded.add((r + dr, c + dc))
+        return frozenset(expanded)
+
+    def _get_patch_ids(cand: Dict) -> List[int]:
+        p1, p2 = cand.get("patch1"), cand.get("patch2")
+        if p1 is None or p2 is None:
+            return []
+        return [int(p1), int(p2)]
+
+    def _get_pair(cand: Dict) -> Tuple[int, int]:
+        p1, p2 = cand.get("patch1"), cand.get("patch2")
+        if p1 is None or p2 is None:
+            return (0, 0)
+        return _pair_key(int(p1), int(p2))
+
+    def _get_cost(cand: Dict) -> float:
+        try:
+            return float(int(cand.get("area", 0) or 0))
+        except Exception:
+            return 0.0
+
+    def _get_base_roi(cand: Dict) -> float:
+        try:
+            pids = _get_patch_ids(cand)
+            if len(pids) < 2:
+                return 0.0
+            s1 = int(patch_sizes.get(int(pids[0]), 0) or 0)
+            s2 = int(patch_sizes.get(int(pids[1]), 0) or 0)
+            cost = float(int(cand.get("area", 0) or 0))
+            if s1 <= 0 or s2 <= 0 or cost <= 0:
+                return 0.0
+            return float(math.sqrt(float(s1) * float(s2)) / cost)
+        except Exception:
+            return 0.0
+
+    def _overlap_obj(cand: Dict) -> object:
+        new_buf = cand.get("buffered_pixels") or frozenset(cand.get("pixels", []))
+        try:
+            return _expand_pixels(frozenset(new_buf))
+        except Exception:
+            return frozenset()
+
+    def _overlap_ratio(cand: Dict, prior: Sequence[object]) -> float:
+        new_buf = cand.get("buffered_pixels") or frozenset(cand.get("pixels", []))
+        new_buf = frozenset(new_buf)
+        denom = float(len(new_buf))
+        if denom <= 0 or not prior:
+            return 0.0
+        best = 0.0
+        for prev in prior:
+            try:
+                ratio = len(new_buf.intersection(prev)) / denom
+            except Exception:
+                continue
+            if ratio > best:
+                best = ratio
+        return best
+
+    picks, base_stats = select_circuit_utility(
+        candidates,
+        budget=float(max(0, int(budget_pixels))),
+        get_patch_ids=_get_patch_ids,
+        get_pair_key=_get_pair,
+        get_cost=_get_cost,
+        get_base_roi=_get_base_roi,
+        overlap_ratio=_overlap_ratio,
+        overlap_obj=_overlap_obj,
+        overlap_reject_ratio=float(overlap_reject_ratio),
+        max_prior_per_pair=3,
+        diminishing_base=0.5,
+    )
+
+    selected: Dict[int, Dict] = {}
+
+    uf = UnionFind()
+    for pid, size in patch_sizes.items():
+        uf.find(int(pid))
+        uf.size[int(pid)] = int(size)
+        uf.count[int(pid)] = 1
+
+    for pick in picks:
+        cand = pick.candidate
+        pids = _get_patch_ids(cand)
+        if len(pids) < 2:
+            continue
+        p1, p2 = int(pids[0]), int(pids[1])
+        cost = int(_get_cost(cand) or 0.0)
+        if cost <= 0:
+            continue
+        uf.union(p1, p2)
+        comp_root = int(uf.find(p1))
+        conn_size = int(uf.size.get(comp_root, 0) or 0)
+        cid = len(selected) + 1
+        selected[cid] = {
+            "pixels": cand.get("pixels", set()),
+            "habitat_pixels": cand.get("habitat_pixels", frozenset()),
+            "patch_ids": {p1, p2},
+            "area": cost,
+            "connected_size": conn_size,
+            "type": pick.corr_type,
+            "utility_score": float(pick.score),
+            "overlap_ratio": float(pick.overlap_ratio),
+        }
+
+    comp_sizes, comp_counts = _build_corridor_stats(selected, patch_sizes)
+    for corr in selected.values():
+        pids = list(corr.get("patch_ids", []))
+        if not pids:
+            continue
+        root = uf.find(int(pids[0]))
+        corr["connected_size"] = int(comp_sizes.get(root, corr.get("connected_size", 0)) or 0)
+
+    largest_group_size = max(comp_sizes.values()) if comp_sizes else 0
+    largest_group_patches = max(comp_counts.values()) if comp_counts else 0
+
+    stats = {
+        "strategy": "circuit_utility",
+        "corridors_used": len(selected),
+        "budget_used": int(float(base_stats.get("budget_used", 0.0) or 0.0)),
+        "budget_total": budget_pixels,
+        "patches_total": len(patch_sizes),
+        "patches_connected": largest_group_patches,
+        "components_remaining": len(comp_sizes) if comp_sizes else len(patch_sizes),
+        "largest_group_size": largest_group_size,
+        "largest_group_patches": largest_group_patches,
+        "primary_links": int(base_stats.get("primary_links", 0) or 0),
+        "redundant_links": int(base_stats.get("redundant_links", 0) or 0),
+        "wasteful_links": int(base_stats.get("wasteful_links", 0) or 0),
+    }
+    return selected, stats
+
+
 def _to_dataclass(params: Dict) -> RasterRunParams:
     """Convert raw parameter dict into the expected dataclass."""
     return RasterRunParams(
@@ -771,8 +2159,8 @@ def _to_dataclass(params: Dict) -> RasterRunParams:
         obstacle_range_upper=params.get("obstacle_range_upper"),
         value_tolerance=float(params.get("value_tolerance", 1e-6)),
         nodata_fallback=float(params.get("nodata_fallback", -9999)),
-        min_patch_size=int(params.get("min_patch_size", 0)),
-        budget_pixels=int(params.get("budget_pixels", 0)),
+        min_patch_size=int(params.get("min_patch_size", 30)),
+        budget_pixels=int(params.get("budget_pixels", 10)),
         max_search_distance=int(params.get("max_search_distance", 50)),
         max_corridor_area=(
             int(params["max_corridor_area"]) if params.get("max_corridor_area") is not None else None
@@ -786,7 +2174,7 @@ def run_raster_analysis(
     layer: QgsRasterLayer,
     output_dir: str,
     raw_params: Dict,
-    strategy: str = "most_connectivity",
+    strategy: str = "circuit_utility",
     temporary: bool = False,
     iface=None,
     progress_cb: Optional[Callable[[int, Optional[str]], None]] = None,
@@ -797,11 +2185,198 @@ def run_raster_analysis(
 
     params = _to_dataclass(raw_params)
     overall_start = time.time()
-
     src_path = layer.source()
-    ds = gdal.Open(src_path)
+    summary_dir = output_dir or os.path.dirname(src_path) or os.getcwd()
+    if not summary_dir:
+        summary_dir = os.getcwd()
+    os.makedirs(summary_dir, exist_ok=True)
+    return _run_raster_analysis_core(
+        layer,
+        output_dir,
+        raw_params,
+        strategy,
+        temporary,
+        iface,
+        progress_cb,
+        params,
+        overall_start,
+    )
+
+
+def _add_raster_run_summary_layer(
+    *,
+    input_layer_name: str,
+    strategy: str,
+    stats: Dict,
+    out_path: str,
+    corridor_path: Optional[str] = None,
+    combined_path: Optional[str] = None,
+) -> None:
+    """Add a small in-project summary table for the raster run."""
+    if QgsVectorLayer is None or QgsProject is None or QgsFeature is None or QgsField is None:
+        return
+    try:
+        title = f"TerraLink Raster Summary ({input_layer_name})"
+        summary_layer = QgsVectorLayer("NoGeometry", title, "memory")
+        if not summary_layer.isValid():
+            return
+        provider = summary_layer.dataProvider()
+        provider.addAttributes([QgsField("item", QVariant.String), QgsField("value", QVariant.String)])
+        summary_layer.updateFields()
+
+        def _add(item: str, value: object) -> None:
+            feat = QgsFeature(summary_layer.fields())
+            feat.setAttributes([str(item), "" if value is None else str(value)])
+            provider.addFeature(feat)
+
+        _add("Input layer", input_layer_name)
+        _add("Strategy", str(strategy))
+        _add("Corridors created", stats.get("corridors_used", 0))
+        _add("Patches connected", stats.get("patches_connected", 0))
+        _add("Connected groups", stats.get("components_remaining", 0))
+        _add("Budget used (px)", stats.get("budget_used", 0))
+        _add("Budget total (px)", stats.get("budget_total", 0))
+        _add("Contiguous areas raster", out_path or "")
+        if corridor_path:
+            _add("Corridor raster", corridor_path)
+        if combined_path:
+            _add("Combined raster", combined_path)
+
+        QgsProject.instance().addMapLayer(summary_layer)
+    except Exception:
+        return
+
+
+def _perform_landscape_analysis(
+    arr: np.ndarray,
+    layer_name: str,
+    res_x: float,
+    res_y: float,
+    is_metric: bool,
+    params: Optional[RasterRunParams] = None,
+) -> List[str]:
+    """Calculate landscape metrics for the output raster (contiguous networks)."""
+    if not HAS_NDIMAGE or ndimage is None:
+        return ["Landscape analysis skipped: scipy.ndimage not found."]
+
+    results = []
+    
+    if is_metric:
+        area_unit, dist_unit = "ha", "km"
+        pixel_area_ha = (res_x * res_y) / 10000.0
+        dist_factor = 1000.0 
+        gyrate_unit = "m"
+    else:
+        area_unit, dist_unit = "pixels", "pixels"
+        pixel_area_ha, dist_factor = 1.0, 1.0
+        gyrate_unit = "pixels"
+
+    # In our network output, 0 is background, >0 is part of a contiguous area
+    habitat_mask = arr > 0
+    n_hab_pixels = np.sum(habitat_mask)
+    if n_hab_pixels == 0:
+        return ["Landscape analysis: No contiguous habitat areas found in output."]
+
+    # Use 8-connectivity to match landscape metric standards
+    s = ndimage.generate_binary_structure(2, 2)
+    labeled_array, num_patches = ndimage.label(habitat_mask, structure=s)
+    if num_patches == 0:
+        return ["Landscape analysis: No contiguous patches identified."]
+        
+    patch_ids = np.arange(1, num_patches + 1)
+    patch_pixel_counts = np.bincount(labeled_array.ravel())[1:]
+    
+    # Edge detection kernel
+    kernel = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]])
+    neighbor_count = ndimage.convolve(habitat_mask.astype(float), kernel, mode='constant', cval=0)
+    edge_map = (4.0 - neighbor_count) * habitat_mask
+    
+    patch_areas_ha = patch_pixel_counts * pixel_area_ha
+    patch_perims_m = ndimage.sum(edge_map, labeled_array, index=patch_ids) * (res_x if is_metric else 1.0)
+    patch_areas_m2 = patch_pixel_counts * (res_x * res_y if is_metric else 1.0)
+    total_area_ha = n_hab_pixels * pixel_area_ha
+    total_edge_m = np.sum(edge_map) * (res_x if is_metric else 1.0)
+
+    # 1. Patch Density & Area Metrics
+    pd = (num_patches / total_area_ha) * 100 if total_area_ha > 0 else 0
+    mesh = np.sum(patch_areas_ha**2) / total_area_ha if total_area_ha > 0 else 0
+    split = (total_area_ha**2) / np.sum(patch_areas_ha**2) if np.sum(patch_areas_ha**2) > 0 else 0
+    lps_ha = np.max(patch_areas_ha) if num_patches > 0 else 0
+    lpi = (lps_ha / total_area_ha) * 100 if total_area_ha > 0 else 0
+    
+    # 2. Aggregation Index
+    denom_ai = (2 * n_hab_pixels - 2 * int(np.sqrt(n_hab_pixels)) - 2)
+    ai = ((n_hab_pixels * 4 - np.sum(edge_map)) / 2) / denom_ai * 100 if denom_ai > 0 else 0
+    
+    # 3. Shape & Complexity Metrics
+    ed = total_edge_m / total_area_ha if total_area_ha > 0 else 0
+    with np.errstate(divide='ignore', invalid='ignore'):
+        msi = np.mean(0.25 * patch_perims_m / np.sqrt(patch_areas_m2)) if num_patches > 0 else 0
+        mean_para = np.mean(patch_perims_m / patch_areas_m2) if num_patches > 0 else 0
+        frac_vals = (2 * np.log(0.25 * patch_perims_m)) / np.log(patch_areas_m2)
+        frac = np.nanmean(frac_vals) if num_patches > 0 else 0
+    
+    # 4. Core Area Metrics
+    core_mask = ndimage.binary_erosion(habitat_mask)
+    cai = (np.sum(core_mask) / n_hab_pixels) * 100 if n_hab_pixels > 0 else 0
+    
+    # 5. Radius of Gyration
+    gyrations = []
+    for p_id in patch_ids:
+        # Performance safety: limit gyration calculation if there are massive numbers of tiny components
+        if num_patches > 1000 and p_id > 200:
+            break
+        coords = np.argwhere(labeled_array == p_id)
+        if len(coords) < 2: continue
+        gyrations.append(np.sqrt(np.mean(np.sum((coords - coords.mean(axis=0))**2, axis=1))) * (res_x if is_metric else 1.0))
+    mean_gyrate = np.mean(gyrations) if gyrations else 0
+
+    header = "=" * 85
+    results.append(header)
+    results.append(f" LANDSCAPE ANALYSIS: {layer_name}")
+    results.append(header)
+    results.append(f"{'METRIC NAME':<30} | {'VALUE':<15} | {'INTERPRETATION'}")
+    results.append("-" * 85)
+    results.append(f"{'Total Area':<30} | {total_area_ha:<15,.2f} | {area_unit}")
+    results.append(f"{'Num. Patches (NP)':<30} | {num_patches:<15} | count")
+    results.append(f"{'Eff. Mesh Size':<30} | {mesh:<15,.2f} | {area_unit} (Functional size)")
+    results.append(f"{'Largest Patch Size':<30} | {lps_ha:<15,.2f} | {area_unit}")
+    results.append(f"{'Splitting Index':<30} | {split:<15.2f} | 1 = solid, High = broken")
+    results.append(f"{'Patch Density (PD)':<30} | {pd:<15.2f} | Patches per 100 units")
+    results.append(f"{'Largest Patch Index (LPI)':<30} | {lpi:<15.2f} | % of landscape")
+    results.append(f"{'Total Edge':<30} | {total_edge_m/dist_factor:<15.2f} | {dist_unit}")
+    results.append(f"{'Mean Shape Index (MSI)':<30} | {msi:<15.2f} | 1.0 = Square, >1 = Complex")
+    results.append(f"{'Edge Density (ED)':<30} | {ed:<15.2f} | m edge per ha")
+    results.append(f"{'Mean PARA':<30} | {mean_para:<15.5f} | Perimeter-Area Ratio")
+    results.append(f"{'Fractal Dimension':<30} | {frac:<15.2f} | Complexity scale")
+    results.append(f"{'Aggregation Index (AI)':<30} | {ai:<15.2f} | 0 = Dispersed, 100 = Clumped")
+    results.append(f"{'Core Area Index (CAI)':<30} | {cai:<15.2f} | % non-peninsula")
+    results.append(f"{'Mean Radius of Gyration':<30} | {mean_gyrate:<15.2f} | {gyrate_unit} (Internal reach)")
+    results.append(header)
+    
+    return results
+
+
+def _run_raster_analysis_core(
+    layer: QgsRasterLayer,
+    output_dir: str,
+    raw_params: Dict,
+    strategy: str = "circuit_utility",
+    temporary: bool = False,
+    iface=None,
+    progress_cb: Optional[Callable[[int, Optional[str]], None]] = None,
+    params: Optional[RasterRunParams] = None,
+    overall_start: Optional[float] = None,
+) -> List[Dict]:
+    """Core raster corridor logic (called by `run_raster_analysis`)."""
+    if params is None:
+        raise RasterAnalysisError("Raster parameters not supplied.")
+    if overall_start is None:
+        overall_start = time.time()
+
+    ds = gdal.Open(layer.source())
     if ds is None:
-        raise RasterAnalysisError(f"Cannot open raster source: {src_path}")
+        raise RasterAnalysisError(f"Cannot open raster source: {layer.source()}")
 
     rows, cols = ds.RasterYSize, ds.RasterXSize
     gt = ds.GetGeoTransform()
@@ -819,29 +2394,45 @@ def run_raster_analysis(
     pixel_size = max(pixel_w, pixel_h)
 
     warnings: List[str] = []
+    blockers: List[str] = []
+
     if total_pixels >= PIXEL_COUNT_WARNING_THRESHOLD:
-        warnings.append(
+        blockers.append(
             "Large raster detected (>{:,} pixels).".format(
                 PIXEL_COUNT_WARNING_THRESHOLD
             )
         )
     if 0 < pixel_size < PIXEL_SIZE_WARNING_THRESHOLD:
-        warnings.append(
+        msg = (
             f"High-resolution data detected (≈{pixel_size:.2f} map units per pixel). "
             "Consider resampling to a coarser resolution for faster corridor modelling."
         )
+        if total_pixels >= PIXEL_FINE_CRITICAL_COUNT:
+            blockers.append(msg)
+        else:
+            warnings.append(msg + " Proceeding because raster size is small.")
 
     if warnings:
         warning_text = " ".join(warnings)
         if iface and hasattr(iface, "messageBar"):
             try:
-                iface.messageBar().pushWarning("Linkscape", warning_text)
+                iface.messageBar().pushMessage("TerraLink", warning_text, level=Qgis.Warning)
+            except Exception:
+                print(f"WARNING: {warning_text}")
+        else:
+            print(f"WARNING: {warning_text}")
+
+    if blockers:
+        warning_text = " ".join(blockers)
+        if iface and hasattr(iface, "messageBar"):
+            try:
+                iface.messageBar().pushWarning("TerraLink", warning_text)
             except Exception:
                 print(f"WARNING: {warning_text}")
         else:
             print(f"WARNING: {warning_text}")
         raise RasterAnalysisError(
-            f"Raster is too large/fine for Linkscape to process efficiently. {warning_text} "
+            f"Raster is too large/fine for TerraLink to process efficiently. {warning_text} "
             "Please resample to a coarser resolution or process in smaller chunks."
         )
     _emit_progress(progress_cb, 5, "Loading raster data…")
@@ -878,17 +2469,26 @@ def run_raster_analysis(
     if params.obstacle_enabled:
         obstacle_pixels = int(np.sum(obstacle_mask))
         if obstacle_pixels:
-            print(f"  ✓ Obstacle pixels: {obstacle_pixels:,}")
+            print(f"  ✓ Impassable pixels: {obstacle_pixels:,}")
         else:
-            print("  ⚠ Obstacle configuration matched no pixels; proceeding without obstacles.")
+            print("  ⚠ Impassable land class configuration matched no pixels; proceeding without impassables.")
     else:
-        print("  ✓ Obstacles disabled.")
+        print("  ✓ Impassable land classes disabled.")
+    obstacle_pixels = int(np.sum(obstacle_mask))
+
+    # NOTE: Background ("matrix") is already treated as passable by default: passable_mask
+    # is derived from (~habitat) & (~impassable). Do not clear impassable pixels here.
     _emit_progress(progress_cb, 35, "Labeling patches…")
 
     print("\n3. Labeling patches...")
     t0 = time.time()
     labels, n_patches = label_patches(habitat_mask, params.patch_connectivity)
     print(f"  ✓ Patches: {n_patches:,} in {time.time() - t0:.2f}s")
+
+    # Preserve the full label map (including small patches) so the contiguous output
+    # can include "bridge patches" that were filtered out by min_patch_size but were
+    # later connected via a corridor.
+    labels_all = labels.copy()
 
     if params.min_patch_size > 0:
         unique_labels, counts = np.unique(labels[labels > 0], return_counts=True)
@@ -897,13 +2497,11 @@ def run_raster_analysis(
         for new_id, old_id in enumerate(valid_labels, 1):
             new_labels[labels == old_id] = new_id
         labels = new_labels
-        patch_mask = (labels > 0).astype(np.uint8)
         print(f"  ✓ After filter: {len(valid_labels):,} patches")
-    else:
-        patch_mask = habitat_mask
 
-    # Keep remaining habitat as obstacles so corridors avoid intact patches, but filtered-out
-    # small patches stay passable/stepping stones.
+    patch_mask = (labels > 0).astype(np.uint8)
+    final_patch_ids = np.unique(labels[labels > 0])
+
     obstacle_mask = obstacle_mask.astype(bool) | patch_mask.astype(bool)
 
     passable_mask = _build_passable_mask(
@@ -912,17 +2510,7 @@ def run_raster_analysis(
         params.min_corridor_width,
         params.allow_bottlenecks,
     )
-
-    debug_label_env = os.environ.get("LINKSCAPE_SAVE_PATCH_LABELS")
-    if debug_label_env:
-        try:
-            label_out_dir = output_dir or os.path.dirname(src_path)
-            os.makedirs(label_out_dir, exist_ok=True)
-            label_path = os.path.join(label_out_dir, "linkscape_patch_labels.tif")
-            write_raster(label_path, labels, gt, proj, nodata=0)
-            print(f"  ✓ Saved patch ID raster: {label_path}")
-        except Exception as label_exc:  # noqa: BLE001
-            print(f"  ⚠ Could not save patch ID raster: {label_exc}")
+    passable_cells = int(np.sum(passable_mask))
 
     unique_labels, counts = np.unique(labels[labels > 0], return_counts=True)
     patch_sizes = dict(zip(unique_labels.tolist(), counts.tolist()))
@@ -938,28 +2526,35 @@ def run_raster_analysis(
         params.max_search_distance,
         params.max_corridor_area,
         params.patch_connectivity,
+        min_corridor_width=params.min_corridor_width,
         obstacle_mask=obstacle_mask,
         passable_mask=passable_mask,
+        strategy=strategy,
         progress_cb=progress_cb,
         progress_start=45,
         progress_end=75,
+        params=params,
+        timing_out=None,
     )
+    candidate_count = len(candidates)
 
     if not candidates:
         raise RasterAnalysisError("No feasible corridors found with the current configuration.")
     _emit_progress(progress_cb, 78, "Optimizing corridor selection…")
 
-    strategy = (strategy or "most_connectivity").lower()
+    strategy = (strategy or "circuit_utility").lower()
+    if strategy not in ("largest_network", "circuit_utility"):
+        strategy = "circuit_utility"
     strategy_map = {
-        "most_connectivity": (
-            optimize_most_connectivity,
-            "linkscape_most_connectivity.tif",
-            "Corridors (Most Connectivity)",
+        "largest_network": (
+            optimize_largest_network,
+            "contiguous_areas_largest_network.tif",
+            "Contiguous Areas (Largest Network)",
         ),
-        "largest_patch": (
-            optimize_largest_patch,
-            "linkscape_largest_patch.tif",
-            "Corridors (Largest Patch)",
+        "circuit_utility": (
+            optimize_circuit_utility,
+            "contiguous_areas_circuit_utility.tif",
+            "Contiguous Areas (Circuit Theory)",
         ),
     }
 
@@ -977,37 +2572,114 @@ def run_raster_analysis(
         raise RasterAnalysisError("Selected optimization did not produce any corridors.")
     _emit_progress(progress_cb, 85, "Rendering output raster…")
 
-    print("  Creating output raster...")
-    output = create_output_raster(
+    print("  Creating corridor and contiguous network area rasters...")
+    corridor_output = create_output_raster(
         labels, corridors, params.min_corridor_width, obstacle_mask=obstacle_mask
+    )
+    network_output = create_contiguous_network_area_raster(
+        labels,
+        corridors,
+        params.min_corridor_width,
+        obstacle_mask=obstacle_mask,
+        labels_all=labels_all,
     )
 
     if temporary:
-        temp_file = tempfile.NamedTemporaryFile(prefix="linkscape_", suffix=".tif", delete=False)
+        temp_file = tempfile.NamedTemporaryFile(prefix="terralink_contiguous_", suffix=".tif", delete=False)
         out_path = temp_file.name
         temp_file.close()
+        temp_corr = tempfile.NamedTemporaryFile(prefix="terralink_corridors_", suffix=".tif", delete=False)
+        corridor_path = temp_corr.name
+        temp_corr.close()
     else:
         out_dir = output_dir or os.path.dirname(src_path)
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, default_filename)
-
-    write_raster(out_path, output, gt, proj, nodata=0)
-    print(f"  ✓ Saved: {out_path}")
-    _emit_progress(progress_cb, 95, "Finishing up…")
+        corridor_path = os.path.join(out_dir, f"corridors_{default_filename}")
 
     try:
-        result_layer = QgsRasterLayer(out_path, layer_name)
-        if result_layer.isValid():
-            QgsProject.instance().addMapLayer(result_layer)
+        # Corridor raster (connected_size per corridor cell)
+        write_raster(corridor_path, corridor_output, gt, proj, nodata=0)
+        print(f"  ✓ Saved corridor raster: {corridor_path}")
+        try:
+            corr_layer_name = layer_name.replace("Contiguous Areas", "Corridors")
+            corr_layer = QgsRasterLayer(corridor_path, corr_layer_name)
+            if corr_layer.isValid():
+                QgsProject.instance().addMapLayer(corr_layer)
+                print("  ✓ Added corridor raster to project")
+        except Exception:
+            pass
+
+        write_raster(out_path, network_output, gt, proj, nodata=0)
+        print(f"  ✓ Saved: {out_path}")
+
+        # --- LANDSCAPE METRICS REPORT (always written) ---
+        landscape_metrics_path = ""
+        analysis_lines: List[str] = []
+        try:
+            is_metric = (layer.crs().mapUnits() == QgsUnitTypes.DistanceMeters)
+            analysis_lines = _perform_landscape_analysis(
+                network_output,
+                layer_name,
+                abs(gt[1]),
+                abs(gt[5]),
+                is_metric,
+                params=params,
+            )
+            safe = "".join(ch if ch.isalnum() or ch in ("_", "-", " ") else "_" for ch in (layer.name() or "raster")).strip()
+            safe = "_".join(safe.split())[:80] if safe else "run"
+            landscape_metrics_path = os.path.join(os.path.dirname(out_path) or os.getcwd(), f"landscape_metrics_{safe}_{strategy}.txt")
+            _write_text_report(landscape_metrics_path, analysis_lines)
+            print(f"  ✓ Saved landscape metrics: {landscape_metrics_path}")
+            try:
+                _add_landscape_metrics_table_layer(f"Landscape Metrics ({layer_name})", analysis_lines)
+            except Exception:
+                pass
+        except Exception as e:
+            # Always write a report, even if computation fails.
+            try:
+                safe = "".join(ch if ch.isalnum() or ch in ("_", "-", " ") else "_" for ch in (layer.name() or "raster")).strip()
+                safe = "_".join(safe.split())[:80] if safe else "run"
+                landscape_metrics_path = os.path.join(os.path.dirname(out_path) or os.getcwd(), f"landscape_metrics_{safe}_{strategy}.txt")
+                analysis_lines = [f"Landscape analysis failed: {e}"]
+                _write_text_report(landscape_metrics_path, analysis_lines)
+                print(f"  ✓ Saved landscape metrics: {landscape_metrics_path}")
+                try:
+                    _add_landscape_metrics_table_layer(f"Landscape Metrics ({layer_name})", analysis_lines)
+                except Exception:
+                    pass
+            except Exception:
+                print(f"  ⚠ Landscape analysis failed: {e}")
+        net_layer = QgsRasterLayer(out_path, layer_name)
+        if net_layer.isValid():
+            try:
+                _apply_random_unique_value_symbology_from_array(net_layer, network_output)
+            except Exception:
+                pass
+            QgsProject.instance().addMapLayer(net_layer)
             print("  ✓ Added to project")
-    except Exception as add_exc:  # noqa: BLE001
-        print(f"  ⚠ Could not add layer to project: {add_exc}")
+    except Exception as net_exc:  # noqa: BLE001
+        print(f"  ⚠ Could not save/add output raster: {net_exc}")
+
+    _emit_progress(progress_cb, 95, "Finishing up…")
 
     elapsed = time.time() - overall_start
     stats = dict(stats)
+    try:
+        if landscape_metrics_path:
+            stats["landscape_metrics_path"] = landscape_metrics_path
+    except Exception:
+        pass
     stats["output_path"] = out_path if not temporary else ""
+    try:
+        stats["corridor_output_path"] = corridor_path if not temporary else ""
+    except Exception:
+        stats["corridor_output_path"] = ""
     stats["layer_name"] = layer_name
     stats["budget_total"] = params.budget_pixels
+    stats["patches_total"] = stats.get("patches_total", len(patch_sizes))
+    stats["habitat_pixels_total"] = sum(patch_sizes.values())
+    stats.update(_compute_connectivity_metrics(corridors, patch_sizes))
 
     print("\n" + "=" * 70)
     print("FINAL SUMMARY")
@@ -1015,21 +2687,46 @@ def run_raster_analysis(
     stats_strategy = stats.get("strategy", strategy)
     print(f"Strategy:          {stats_strategy.replace('_', ' ').title()}")
     print(f"Corridors created: {stats.get('corridors_used', 0)}")
-    if stats_strategy == "most_connectivity":
-        print(f"Connections:       {stats.get('connections_made', 0)}")
-        print(f"Largest patch:     {stats.get('largest_group_size', 0):,} px")
-    elif "connections_made" in stats:
+    print(f"Connected groups:  {stats.get('components_remaining', 0)}")
+    print(f"Edges used:        {stats.get('edges_used', 0)}")
+    print(f"Avg degree:        {stats.get('avg_degree', 0):.2f}")
+    print(f"Redundant links:   {stats.get('redundant_links', 0)}")
+    if "connections_made" in stats:
         print(f"Connections:       {stats.get('connections_made', 0)}")
     if "seed_id" in stats:
         print(f"Seed patch:        {stats.get('seed_id')}")
     print(f"Final size:        {stats.get('final_patch_size', 0):,} px")
-    print(f"Budget used:       {stats.get('budget_used', 0)}/{params.budget_pixels} px")
+    print(f"Corridor budget:   {params.budget_pixels} px")
+    print(f"Budget used:       {stats.get('budget_used', 0)} px")
+    if "entropy_total" in stats:
+        print("\nNetwork Metrics:")
+        print(f"  Entropy (H_total): {stats.get('entropy_total', 0):.4f}")
+        if "entropy_movement" in stats:
+            print(f"  Movement entropy:  {stats.get('entropy_movement', 0):.4f}")
+        if "robustness_rho2" in stats:
+            print(f"  Robustness (ρ₂):   {stats.get('robustness_rho2', 0):.4f}")
+        if "topology_penalty" in stats:
+            print(f"  Topology penalty:  {stats.get('topology_penalty', 0):.1f}")
+        print(f"  Mode:              {stats.get('mode', 'N/A')}")
     print(f"Processing time:   {elapsed:.1f}s")
     if temporary:
         print("Output:            Temporary raster layer")
     else:
         print(f"Output GeoTIFF:    {out_path}")
     print("=" * 70)
+
+    # Add a lightweight in-project summary table instead of writing/opening text files.
+    try:
+        _add_raster_run_summary_layer(
+            input_layer_name=layer.name(),
+            strategy=strategy.replace("_", " ").title(),
+            stats=stats,
+            out_path=out_path if not temporary else "",
+            corridor_path=corridor_path if "corridor_path" in locals() and not temporary else None,
+            combined_path=None,
+        )
+    except Exception:
+        pass
 
     ds = None
     _emit_progress(progress_cb, 100, "Raster analysis complete.")

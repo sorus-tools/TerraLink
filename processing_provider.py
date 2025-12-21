@@ -2,10 +2,10 @@ from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import QgsProcessingAlgorithm, QgsProcessingProvider
 
 
-class LinkscapeLaunchAlgorithm(QgsProcessingAlgorithm):
-    """Processing entry that opens the Linkscape dialog."""
+class TerraLinkLaunchAlgorithm(QgsProcessingAlgorithm):
+    """Processing entry that opens the TerraLink dialog."""
 
-    ALG_ID = "linkscape_corridor_analysis"
+    ALG_ID = "terralink_v1_1_corridor_generation"
 
     def __init__(self, plugin):
         super().__init__()
@@ -15,51 +15,52 @@ class LinkscapeLaunchAlgorithm(QgsProcessingAlgorithm):
         return self.ALG_ID
 
     def displayName(self) -> str:
-        return self.tr("Linkscape Corridor Analysis")
+        return self.tr("TerraLink Corridor Generation")
 
     def group(self) -> str:
+        # No subgroup: show directly under the SORUS provider.
         return ""
 
     def groupId(self) -> str:
         return ""
 
     def shortHelpString(self) -> str:
-        return self.tr("Opens the Linkscape dialog so you can configure and run analyses.")
+        return self.tr("Opens the TerraLink dialog so you can configure and run analyses.")
 
     def flags(self):
         return super().flags() | QgsProcessingAlgorithm.FlagNoThreading
 
     def tr(self, string: str) -> str:
-        return QCoreApplication.translate("LinkscapeLaunchAlgorithm", string)
+        return QCoreApplication.translate("TerraLinkLaunchAlgorithm", string)
 
     def initAlgorithm(self, config=None):  # noqa: D401 - required override
         """No parameters to declare."""
         return
 
     def processAlgorithm(self, parameters, context, feedback):
-        feedback.pushInfo(self.tr("Opening Linkscape dialog..."))
+        feedback.pushInfo(self.tr("Opening TerraLink dialog..."))
         self._plugin.run()
         return {}
 
     def createInstance(self):
-        return LinkscapeLaunchAlgorithm(self._plugin)
+        return TerraLinkLaunchAlgorithm(self._plugin)
 
 
-class LinkscapeProcessingProvider(QgsProcessingProvider):
-    """Processing provider that exposes the Linkscape launcher."""
+class TerraLinkProcessingProvider(QgsProcessingProvider):
+    """Processing provider that exposes the TerraLink launcher."""
 
     def __init__(self, plugin):
         super().__init__()
         self._plugin = plugin
 
     def id(self) -> str:
-        return "linkscape"
+        return "terralink_v1_1"
 
     def name(self) -> str:
-        return self.tr("SORUS")
+        return self.tr("TerraLink (v1.1)")
 
     def tr(self, string: str) -> str:
-        return QCoreApplication.translate("LinkscapeProcessingProvider", string)
+        return QCoreApplication.translate("TerraLinkProcessingProvider", string)
 
     def loadAlgorithms(self):
-        self.addAlgorithm(LinkscapeLaunchAlgorithm(self._plugin))
+        self.addAlgorithm(TerraLinkLaunchAlgorithm(self._plugin))

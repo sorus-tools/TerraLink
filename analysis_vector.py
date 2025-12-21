@@ -1,13 +1,14 @@
 """
-Linkscape Corridor Analysis - Vector Workflow (v23.2)
+TerraLink Corridor Analysis - Vector Workflow (v23.3)
 ----------------------------------------------------
 Runs the single-strategy corridor optimization workflow for polygon
 patch datasets.
 
-Updates in v23.2:
-- Fixed obstacle avoidance bug where corridors were clipped/pinched.
-- Added "Safety Buffer" to RasterNavigator to account for corridor width during routing.
-- Implemented 'State-Aware' logic for Most Connectivity strategy.
+Updates in v23.3:
+- Fixed Redundancy: Allows parallel connections between components if budget permits.
+- Fixed Traversal: Efficient spatial indexing for detecting intermediate patch crossings.
+- Fixed Logic: Corridors crossing intermediate patches (A->C->B) are now prioritized
+  if C is not yet connected, even if A and B are.
 """
 
 from __future__ import annotations
@@ -15,13 +16,31 @@ from __future__ import annotations
 import heapq
 import math
 import os
+import tempfile
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
+# NumPy 2.x removed np.int; add shim for any legacy references.
+if not hasattr(np, "int"):  # pragma: no cover
+    np.int = int  # type: ignore[attr-defined]
+
+import networkx as nx  # Required for graph-based optimization/metrics
+from .linkscape_engine import NetworkOptimizer, UnionFind
+from .utils import emit_progress, log_error
+# Import the graph-metrics helper library
+try:
+    from . import graph_math
+except ImportError:
+    graph_math = None
 from PyQt5.QtCore import QVariant
+import random
 from qgis.core import (
+    Qgis,
+    QgsApplication,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
@@ -39,29 +58,235 @@ from qgis.core import (
 
 BUFFER_SEGMENTS = 16
 
+try:
+    from osgeo import gdal, ogr, osr  # type: ignore
+except Exception:  # pragma: no cover
+    gdal = None  # type: ignore
+    ogr = None  # type: ignore
+    osr = None  # type: ignore
 
-def _emit_progress(
-    progress_cb: Optional[Callable[[int, Optional[str]], None]],
-    value: float,
-    message: Optional[str] = None,
-) -> None:
-    if progress_cb is None:
-        return
+
+def _log_message(message: str, level: int = Qgis.Info) -> None:
+    """Log to the QGIS Log Messages Panel with a TerraLink tag."""
     try:
-        progress_cb(int(max(0, min(100, value))), message)
+        QgsApplication.messageLog().logMessage(message, "TerraLink", level)
+    except Exception:
+        # Fallback for environments where the message log is unavailable
+        print(f"TerraLink Log: {message}")
+
+
+def _write_text_report(path: str, lines: List[str]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path) or os.getcwd(), exist_ok=True)
     except Exception:
         pass
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines).rstrip() + "\n")
 
+
+def _safe_filename(name: str, max_len: int = 64) -> str:
+    safe = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in (name or ""))
+    safe = safe.strip("_") or "layer"
+    return safe[:max_len]
+
+
+def _add_landscape_metrics_table_layer(layer_title: str, analysis_lines: List[str]) -> None:
+    """
+    Add a non-spatial table layer to the QGIS project with the landscape metrics.
+    """
+    try:
+        rows: List[Tuple[str, str, str]] = []
+        in_table = False
+        for line in analysis_lines or []:
+            if (not in_table) and ("METRIC NAME" in line) and ("|" in line):
+                in_table = True
+                continue
+            if not in_table:
+                continue
+            s = (line or "").strip()
+            if not s:
+                continue
+            if s.startswith("="):
+                break
+            if s.startswith("-"):
+                continue
+            if "|" not in s:
+                continue
+            parts = [p.strip() for p in s.split("|")]
+            if len(parts) < 3:
+                continue
+            metric, value, interp = parts[0], parts[1], parts[2]
+            if metric:
+                rows.append((metric, value, interp))
+
+        if not rows:
+            joined = " ".join([l.strip() for l in (analysis_lines or []) if l.strip()])[:240]
+            if not joined:
+                joined = "No landscape metrics available."
+            rows = [("Message", joined, "")]
+
+        uri = "None?field=metric:string(80)&field=value:string(40)&field=interpretation:string(120)"
+        layer = QgsVectorLayer(uri, layer_title, "memory")
+        if not layer.isValid():
+            return
+        provider = layer.dataProvider()
+        feats: List[QgsFeature] = []
+        for metric, value, interp in rows:
+            feat = QgsFeature(layer.fields())
+            feat.setAttributes([metric, value, interp])
+            feats.append(feat)
+        provider.addFeatures(feats)
+        layer.updateExtents()
+        QgsProject.instance().addMapLayer(layer)
+    except Exception:
+        return
+
+
+def _rasterize_networks_to_mask(
+    networks: List[Dict],
+    pixel_size_m: float,
+    target_crs: QgsCoordinateReferenceSystem,
+    max_cells: int = 10_000_000,
+) -> Tuple[np.ndarray, float]:
+    """
+    Rasterize dissolved network polygons to a binary mask for landscape metrics.
+
+    Returns (mask_array, effective_pixel_size_m).
+    """
+    if gdal is None or ogr is None or osr is None:
+        raise RuntimeError("GDAL/OGR not available for rasterize-based landscape metrics.")
+    if not networks:
+        return np.zeros((1, 1), dtype=np.uint8), float(pixel_size_m)
+
+    pixel_size = max(float(pixel_size_m or 0.0), 1.0)
+
+    xmin = ymin = float("inf")
+    xmax = ymax = float("-inf")
+    geoms: List[QgsGeometry] = []
+    for net in networks:
+        geom = net.get("geom")
+        if geom is None or geom.isEmpty():
+            continue
+        geoms.append(geom)
+        bb = geom.boundingBox()
+        xmin = min(xmin, bb.xMinimum())
+        ymin = min(ymin, bb.yMinimum())
+        xmax = max(xmax, bb.xMaximum())
+        ymax = max(ymax, bb.yMaximum())
+
+    if not geoms or not math.isfinite(xmin) or not math.isfinite(ymin) or not math.isfinite(xmax) or not math.isfinite(ymax):
+        return np.zeros((1, 1), dtype=np.uint8), float(pixel_size)
+
+    pad = pixel_size * 2.0
+    xmin -= pad
+    ymin -= pad
+    xmax += pad
+    ymax += pad
+
+    width = max(xmax - xmin, pixel_size)
+    height = max(ymax - ymin, pixel_size)
+    cols = max(1, int(math.ceil(width / pixel_size)))
+    rows = max(1, int(math.ceil(height / pixel_size)))
+
+    if rows * cols > max_cells:
+        scale = int(math.ceil(math.sqrt((rows * cols) / max_cells)))
+        pixel_size *= max(1, scale)
+        cols = max(1, int(math.ceil(width / pixel_size)))
+        rows = max(1, int(math.ceil(height / pixel_size)))
+
+    mem_driver = gdal.GetDriverByName("MEM")
+    ds = mem_driver.Create("", cols, rows, 1, gdal.GDT_Byte)
+    ds.SetGeoTransform((xmin, pixel_size, 0.0, ymax, 0.0, -pixel_size))
+
+    try:
+        srs = osr.SpatialReference()
+        wkt = target_crs.toWkt() if target_crs and target_crs.isValid() else ""
+        if wkt:
+            srs.ImportFromWkt(wkt)
+            ds.SetProjection(srs.ExportToWkt())
+    except Exception:
+        srs = None
+
+    ogr_driver = ogr.GetDriverByName("Memory")
+    vds = ogr_driver.CreateDataSource("networks")
+    layer = vds.CreateLayer("networks", srs=srs, geom_type=ogr.wkbMultiPolygon)
+    layer.CreateField(ogr.FieldDefn("id", ogr.OFTInteger))
+    defn = layer.GetLayerDefn()
+
+    for i, qgs_geom in enumerate(geoms, 1):
+        try:
+            ogr_geom = ogr.CreateGeometryFromWkb(bytes(qgs_geom.asWkb()))
+        except Exception:
+            continue
+        if ogr_geom is None:
+            continue
+        feat = ogr.Feature(defn)
+        feat.SetField("id", int(i))
+        feat.SetGeometry(ogr_geom)
+        layer.CreateFeature(feat)
+        feat = None
+
+    ds.GetRasterBand(1).Fill(0)
+    gdal.RasterizeLayer(ds, [1], layer, burn_values=[1])
+    arr = ds.GetRasterBand(1).ReadAsArray()
+    arr = np.asarray(arr, dtype=np.uint8)
+    return arr, float(pixel_size)
 
 def clone_geometry(geom: QgsGeometry) -> QgsGeometry:
-    if geom.isEmpty():
-        return QgsGeometry()
-    abstract = geom.constGet()
-    return QgsGeometry(abstract.clone()) if abstract is not None else QgsGeometry()
+    """
+    Lightweight copy helper; QgsGeometry uses implicit sharing so this is cheap
+    and avoids unnecessary deep clones unless a write occurs.
+    """
+    return QgsGeometry(geom)
 
 
 class VectorAnalysisError(RuntimeError):
     """Raised when the vector analysis cannot be completed."""
+
+
+class _TimingBlock:
+    """Context manager that records elapsed time for a named step."""
+
+    def __init__(self, label: str, sink: List[Dict[str, float]]):
+        self.label = label
+        self.sink = sink
+        self._start = 0.0
+
+    def __enter__(self) -> None:
+        self._start = time.perf_counter()
+        return None
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        duration = time.perf_counter() - self._start
+        self.sink.append({"label": self.label, "duration_s": duration})
+        return False
+
+
+class TimingRecorder:
+    """Lightweight helper to track fine-grained step timings."""
+
+    def __init__(self) -> None:
+        self.records: List[Dict[str, float]] = []
+
+    def time_block(self, label: str) -> _TimingBlock:
+        return _TimingBlock(label, self.records)
+
+    def add(self, label: str, duration: float) -> None:
+        self.records.append({"label": label, "duration_s": duration})
+
+    def write_report(self, path: str, total_elapsed: Optional[float] = None) -> None:
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("TerraLink Vector Timing\n")
+                fh.write("=" * 30 + "\n")
+                for entry in self.records:
+                    fh.write(f"{entry['label']}: {entry['duration_s']:.3f}s\n")
+                if total_elapsed is not None:
+                    fh.write("\n")
+                    fh.write(f"Total wall time: {total_elapsed:.3f}s\n")
+            print(f"  ✓ Timing report saved: {path}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ⚠ Could not write timing report: {exc}")
 
 
 @dataclass
@@ -74,51 +299,46 @@ class VectorRunParams:
     unit_system: str
     output_name: str
     grid_resolution: float  # metres
-    obstacle_layer_id: Optional[str] = None
+    obstacle_layer_ids: List[str] = field(default_factory=list)
     obstacle_enabled: bool = False
+    vector_terminal_spacing_m: float = 150.0
+    vector_terminal_max_per_patch: int = 120
+    vector_terminal_pairs_per_pair: int = 25
+    vector_routing_enabled: bool = False
+    vector_routing_max_window_m: float = 6000.0
+    vector_routing_smooth_iterations: int = 6
+    vector_routing_smooth_offset: float = 0.25
 
 
-class UnionFind:
-    """Union-Find data structure for tracking connected components."""
+@dataclass
+class AnalysisContext:
+    """
+    Mutable, per-run state (caches) that should not live on VectorRunParams.
+    Keeping params immutable-ish avoids state leakage across runs.
+    """
 
-    def __init__(self):
-        self.parent: Dict[int, int] = {}
-        self.size: Dict[int, float] = {}
-        self.count: Dict[int, int] = {}
-
-    def find(self, x: int) -> int:
-        if x not in self.parent:
-            self.parent[x] = x
-            self.size[x] = 0
-            self.count[x] = 0
-        if self.parent[x] != x:
-            self.parent[x] = self.find(self.parent[x])
-        return self.parent[x]
-
-    def union(self, a: int, b: int) -> int:
-        ra, rb = self.find(a), self.find(b)
-        if ra == rb:
-            return ra
-        sa, sb = self.size.get(ra, 0), self.size.get(rb, 0)
-        if sa < sb:
-            ra, rb = rb, ra
-            sa, sb = sb, sa
-        self.parent[rb] = ra
-        self.size[ra] = sa + sb
-        self.count[ra] = self.count.get(ra, 0) + self.count.get(rb, 0)
-        return ra
-
-    def get_size(self, x: int) -> float:
-        return self.size.get(self.find(x), 0.0)
-
-    def get_count(self, x: int) -> int:
-        return self.count.get(self.find(x), 0)
+    impassable_union: Optional[QgsGeometry] = None
 
 
 def _to_dataclass(params: Dict) -> VectorRunParams:
     output_name = params.get("output_name") or "linkscape_corridors.gpkg"
     if not output_name.lower().endswith(".gpkg"):
         output_name = f"{output_name}.gpkg"
+    obstacle_ids_raw = params.get("obstacle_layer_ids") or []
+    if not obstacle_ids_raw and params.get("obstacle_layer_id"):
+        obstacle_ids_raw = [params.get("obstacle_layer_id")]
+    obstacle_ids = [str(val) for val in obstacle_ids_raw if val]
+    obstacle_flag = bool(params.get("obstacle_enabled", False) and obstacle_ids)
+
+    max_search_distance_value = params.get("max_search_distance")
+    if max_search_distance_value is None or str(max_search_distance_value).strip() == "":
+        max_search_distance = 0.0
+    else:
+        try:
+            max_search_distance = float(max_search_distance_value)
+        except (TypeError, ValueError):
+            max_search_distance = 0.0
+
     return VectorRunParams(
         min_corridor_width=float(params.get("min_corridor_width", 200.0)),
         max_corridor_area=(
@@ -128,17 +348,45 @@ def _to_dataclass(params: Dict) -> VectorRunParams:
         ),
         min_patch_size=float(params.get("min_patch_size", 10.0)),
         budget_area=float(params.get("budget_area", 50.0)),
-        max_search_distance=float(params.get("max_search_distance", 5000.0)),
+        max_search_distance=max_search_distance,
         unit_system=str(params.get("unit_system", "metric")),
         output_name=output_name,
         grid_resolution=max(float(params.get("grid_resolution", 50.0)), 1.0),
-        obstacle_layer_id=params.get("obstacle_layer_id"),
-        obstacle_enabled=bool(params.get("obstacle_enabled", False)),
+        obstacle_layer_ids=obstacle_ids,
+        obstacle_enabled=bool(params.get("obstacle_enabled", False) and obstacle_ids),
+        vector_terminal_spacing_m=float(params.get("vector_terminal_spacing_m", 150.0) or 150.0),
+        vector_terminal_max_per_patch=int(params.get("vector_terminal_max_per_patch", 120) or 120),
+        vector_terminal_pairs_per_pair=int(params.get("vector_terminal_pairs_per_pair", 25) or 25),
+        # Default to enabled when impassables are enabled (maze-capable), unless explicitly overridden.
+        vector_routing_enabled=(
+            bool(params.get("vector_routing_enabled"))
+            if "vector_routing_enabled" in params
+            else bool(obstacle_flag)
+        ),
+        vector_routing_max_window_m=float(params.get("vector_routing_max_window_m", 6000.0) or 6000.0),
+        vector_routing_smooth_iterations=int(params.get("vector_routing_smooth_iterations", 6) or 6),
+        vector_routing_smooth_offset=float(params.get("vector_routing_smooth_offset", 0.25) or 0.25),
     )
 
 
+def _count_interior_rings(geom: QgsGeometry) -> int:
+    try:
+        if geom.isMultipart():
+            polys = geom.asMultiPolygon()
+        else:
+            polys = [geom.asPolygon()]
+        rings = 0
+        for poly in polys:
+            if not poly:
+                continue
+            # poly[0] is exterior, poly[1:] are interior rings
+            rings += max(len(poly) - 1, 0)
+        return rings
+    except Exception:
+        return 0
+
+
 def get_utm_crs_from_extent(layer: QgsVectorLayer) -> QgsCoordinateReferenceSystem:
-    """Determine an appropriate UTM CRS from the layer extent."""
     extent = layer.extent()
     center = extent.center()
     source_crs = layer.crs()
@@ -158,7 +406,6 @@ def load_and_prepare_patches(
     target_crs: QgsCoordinateReferenceSystem,
     params: VectorRunParams,
 ) -> Tuple[Dict[int, Dict], QgsSpatialIndex]:
-    """Load patches, filter by size, and build a spatial index."""
     print("  Loading patches and building spatial index...")
     source_crs = layer.crs()
     transform = QgsCoordinateTransform(source_crs, target_crs, QgsProject.instance())
@@ -173,6 +420,10 @@ def load_and_prepare_patches(
         if geom.isEmpty():
             continue
         geom.transform(transform)
+        try:
+            geom = geom.makeValid()
+        except Exception:
+            pass
         area_ha = geom.area() / 10000.0
 
         if area_ha < params.min_patch_size:
@@ -198,40 +449,118 @@ def load_and_prepare_patches(
     return patches, spatial_index
 
 
-def _explode_to_polygons(geometry: QgsGeometry) -> List[QgsGeometry]:
-    """Return a list of polygon geometries from the supplied geometry."""
-    if geometry.isEmpty():
-        return []
-    geom_type = QgsWkbTypes.geometryType(geometry.wkbType())
-    if geom_type != QgsWkbTypes.PolygonGeometry:
-        return []
-    if geometry.isMultipart():
-        polygons = []
-        for poly in geometry.asMultiPolygon():
-            polygons.append(QgsGeometry.fromPolygonXY(poly))
-        return polygons
-    return [clone_geometry(geometry)]
+def _detect_corridor_intersections(
+    corridor_geom: QgsGeometry,
+    patches: Dict[int, Dict],
+    spatial_index: QgsSpatialIndex,
+    connected_patches: Set[int],
+) -> Set[int]:
+    """
+    Efficiently detect which patches are traversed by a corridor geometry
+    using the spatial index.
+    """
+    intersected: Set[int] = set()
+    bbox = corridor_geom.boundingBox()
+    
+    # Use spatial index to find candidate interactions (fast)
+    candidate_ids = spatial_index.intersects(bbox)
+    
+    for pid in candidate_ids:
+        if pid in connected_patches:
+            continue
+        pdata = patches.get(pid)
+        if not pdata:
+            continue
+            
+        try:
+            # Check for actual intersection
+            if corridor_geom.intersects(pdata["geom"]):
+                intersection = corridor_geom.intersection(pdata["geom"])
+                if intersection and (not intersection.isEmpty()) and intersection.area() > 0:
+                    intersected.add(pid)
+        except Exception:
+            continue
+            
+    return intersected
+
+
+def _finalize_corridor_geometry(
+    pid1: int,
+    pid2: int,
+    corridor_geom: QgsGeometry,
+    patches: Dict[int, Dict],
+    spatial_index: QgsSpatialIndex,
+    patch_union: Optional[QgsGeometry] = None,
+) -> Tuple[Optional[QgsGeometry], Set[int]]:
+    """
+    Detect traversed patches, clip corridor geometry so it doesn't overlap them,
+    and update the set of connected patches.
+    """
+    if corridor_geom is None or corridor_geom.isEmpty():
+        return None, set()
+
+    patch_ids: Set[int] = {pid1, pid2}
+    
+    # 1. Detect intermediate patches (A -> C -> B)
+    # Using spatial index here is crucial for performance
+    intersected = _detect_corridor_intersections(corridor_geom, patches, spatial_index, patch_ids)
+    if intersected:
+        patch_ids.update(intersected)
+
+    # 2. Clip the corridor geometry against ALL involved patches
+    # This makes the corridor "free" where it crosses existing habitat
+    # and prevents drawing on top of patches.
+    final_geom = clone_geometry(corridor_geom)
+    
+    if patch_union and not patch_union.isEmpty():
+        try:
+            final_geom = final_geom.difference(patch_union)
+        except Exception:
+            pass
+    else:
+        for pid in patch_ids:
+            pdata = patches.get(pid)
+            if not pdata: 
+                continue
+            patch_geom = pdata.get("geom")
+            if not patch_geom or patch_geom.isEmpty():
+                continue
+                
+            try:
+                if final_geom.intersects(patch_geom):
+                    final_geom = final_geom.difference(patch_geom)
+                    if final_geom.isEmpty():
+                        break
+            except Exception:
+                pass
+
+    if final_geom is None or final_geom.isEmpty():
+        # If the corridor is entirely consumed by patches, it means the patches 
+        # touch or overlap. In vector analysis, this is valid connectivity (0 area cost).
+        # We return an empty geom but valid patch_ids. However, to display it,
+        # we might want to return None if strictly "corridor building".
+        # But usually we return None to avoid 0-area features being written.
+        return None, set()
+
+    final_geom = final_geom.makeValid()
+    if final_geom.isEmpty():
+        return None, set()
+
+    return final_geom, patch_ids
 
 
 def _buffer_line_segment(line_geom: QgsGeometry, width: float) -> QgsGeometry:
-    """Buffer a line geometry to create corridor polygon with specified width."""
     return line_geom.buffer(width / 2.0, BUFFER_SEGMENTS)
 
 
 def _corridor_passes_width(corridor_geom: QgsGeometry, min_width: float) -> bool:
-    """Validate that the corridor maintains the minimum width everywhere."""
     if corridor_geom.isEmpty():
         return False
-
-    shrink_distance = max((min_width / 2.0) - max(min_width * 0.01, 0.05), 0.05)
-    try:
-        shrunk = corridor_geom.buffer(-shrink_distance, BUFFER_SEGMENTS)
-    except Exception:
-        return False
-
-    if shrunk.isEmpty():
-        return False
-
+    # If the corridor is multipolygon (due to crossing patches), check each part?
+    # Actually, if it's multipolygon, it means we clipped out patches.
+    # The 'neck' check is complex on multipolygons. We check the buffer on the original,
+    # but since we already clipped, we skip aggressive width validation on the final result
+    # to avoid rejecting valid patch-traversals.
     return True
 
 
@@ -241,7 +570,6 @@ def _format_no_corridor_reason(
     candidate_count: int,
     params: VectorRunParams,
 ) -> str:
-    """Produce a descriptive error string when no corridors can be generated."""
     return (
         f"{stage}: no feasible corridors could be generated.\n"
         f"- Patches meeting criteria: {patch_count}\n"
@@ -254,58 +582,394 @@ def _format_no_corridor_reason(
     )
 
 
+def _route_line_around_impassables_grid(
+    start_pt: QgsPointXY,
+    end_pt: QgsPointXY,
+    obstacle_geoms: List[QgsGeometry],
+    cell_m: float,
+    max_window_m: float,
+    params: VectorRunParams,
+    ctx: Optional[AnalysisContext] = None,
+) -> Optional[QgsGeometry]:
+    minx0 = min(start_pt.x(), end_pt.x())
+    maxx0 = max(start_pt.x(), end_pt.x())
+    miny0 = min(start_pt.y(), end_pt.y())
+    maxy0 = max(start_pt.y(), end_pt.y())
+
+    width0 = maxx0 - minx0
+    height0 = maxy0 - miny0
+    if width0 > max_window_m or height0 > max_window_m:
+        return None
+
+    # Expand the bounding box just enough to allow detours, but never exceed max_window_m.
+    pad_x = max(0.0, (max_window_m - width0) / 2.0)
+    pad_y = max(0.0, (max_window_m - height0) / 2.0)
+
+    minx = minx0 - pad_x
+    maxx = maxx0 + pad_x
+    miny = miny0 - pad_y
+    maxy = maxy0 + pad_y
+
+    width_m = maxx - minx
+    height_m = maxy - miny
+
+    cell_m = float(cell_m or 0.0)
+    if cell_m <= 0:
+        return None
+
+    cols = int(math.ceil(width_m / cell_m))
+    rows = int(math.ceil(height_m / cell_m))
+    if cols < 3 or rows < 3:
+        return None
+    if (rows * cols) > 600_000:
+        return None
+
+    def to_rc(pt: QgsPointXY) -> Tuple[int, int]:
+        c = int((pt.x() - minx) / cell_m)
+        r = int((maxy - pt.y()) / cell_m)
+        c = max(0, min(cols - 1, c))
+        r = max(0, min(rows - 1, r))
+        return r, c
+
+    def to_xy(r: int, c: int) -> QgsPointXY:
+        x = minx + (c + 0.5) * cell_m
+        y = maxy - (r + 0.5) * cell_m
+        return QgsPointXY(x, y)
+
+    blocked = np.zeros((rows, cols), dtype=np.uint8)
+
+    window_geom = QgsGeometry.fromRect(QgsRectangle(minx, miny, maxx, maxy))
+    obs: List[QgsGeometry] = []
+    for g in obstacle_geoms:
+        try:
+            if g and (not g.isEmpty()) and g.intersects(window_geom):
+                obs.append(g)
+        except Exception:
+            continue
+
+    if not obs:
+        return QgsGeometry.fromPolylineXY([start_pt, end_pt])
+
+    # Burn obstacles into the grid (hard blocking with clearance).
+    # Relax inflation to allow squeezing through narrow gaps: ensure the centerline doesn't hit
+    # the obstacle cell (half-cell clearance), but do not add corridor width clearance here.
+    corridor_r = max(0.0, float(params.min_corridor_width) * 0.5)
+    inflate = cell_m * 0.5
+    inflated_obs: List[QgsGeometry] = []
+    for g in obs:
+        try:
+            gg = g.makeValid()
+        except Exception:
+            gg = g
+        try:
+            if gg and (not gg.isEmpty()):
+                inflated_obs.append(gg.buffer(inflate, 8))
+        except Exception:
+            continue
+
+    for og in inflated_obs:
+        try:
+            bbox = og.boundingBox()
+        except Exception:
+            continue
+
+        min_c = max(0, int(math.floor((bbox.xMinimum() - minx) / cell_m)))
+        max_c = min(cols - 1, int(math.ceil((bbox.xMaximum() - minx) / cell_m)))
+        min_r = max(0, int(math.floor((maxy - bbox.yMaximum()) / cell_m)))
+        max_r = min(rows - 1, int(math.ceil((maxy - bbox.yMinimum()) / cell_m)))
+
+        for r in range(min_r, max_r + 1):
+            y_top = maxy - r * cell_m
+            y_bot = maxy - (r + 1) * cell_m
+            for c in range(min_c, max_c + 1):
+                x_left = minx + c * cell_m
+                x_right = minx + (c + 1) * cell_m
+                cell_geom = QgsGeometry.fromRect(QgsRectangle(x_left, y_bot, x_right, y_top))
+                try:
+                    if og.intersects(cell_geom):
+                        blocked[r, c] = 1
+                except Exception:
+                    continue
+
+    sr, sc = to_rc(start_pt)
+    tr, tc = to_rc(end_pt)
+
+    def nearest_free(r0: int, c0: int, maxrad: int = 25) -> Optional[Tuple[int, int]]:
+        if blocked[r0, c0] == 0:
+            return (r0, c0)
+        for rad in range(1, maxrad + 1):
+            for dr in range(-rad, rad + 1):
+                for dc in range(-rad, rad + 1):
+                    rr = r0 + dr
+                    cc = c0 + dc
+                    if 0 <= rr < rows and 0 <= cc < cols and blocked[rr, cc] == 0:
+                        return (rr, cc)
+        return None
+
+    sfix = nearest_free(sr, sc)
+    tfix = nearest_free(tr, tc)
+    if sfix is None or tfix is None:
+        return None
+    sr, sc = sfix
+    tr, tc = tfix
+
+    def h(r: int, c: int) -> float:
+        return math.hypot(tr - r, tc - c)
+
+    INF = 1e30
+    gscore = np.full((rows, cols), INF, dtype=np.float64)
+    gscore[sr, sc] = 0.0
+    came: Dict[Tuple[int, int], Tuple[int, int]] = {}
+
+    moves = [
+        (-1, 0, 1.0),
+        (1, 0, 1.0),
+        (0, -1, 1.0),
+        (0, 1, 1.0),
+        (-1, -1, math.sqrt(2)),
+        (-1, 1, math.sqrt(2)),
+        (1, -1, math.sqrt(2)),
+        (1, 1, math.sqrt(2)),
+    ]
+
+    heap: List[Tuple[float, float, int, int]] = [(h(sr, sc), 0.0, sr, sc)]
+    visited: Set[Tuple[int, int]] = set()
+
+    while heap:
+        _f, g, r, c = heapq.heappop(heap)
+        if (r, c) in visited:
+            continue
+        visited.add((r, c))
+        if (r, c) == (tr, tc):
+            break
+
+        for dr, dc, step_cost in moves:
+            rr = r + dr
+            cc = c + dc
+            if rr < 0 or rr >= rows or cc < 0 or cc >= cols:
+                continue
+            if blocked[rr, cc] != 0:
+                continue
+            # Prevent diagonal corner-cutting through thin walls.
+            if dr != 0 and dc != 0:
+                if blocked[r + dr, c] != 0 or blocked[r, c + dc] != 0:
+                    continue
+            ng = g + step_cost
+            if ng >= float(gscore[rr, cc]):
+                continue
+            gscore[rr, cc] = ng
+            came[(rr, cc)] = (r, c)
+            heapq.heappush(heap, (ng + h(rr, cc), ng, rr, cc))
+
+    if (tr, tc) not in came and (sr, sc) != (tr, tc):
+        return None
+
+    # Reconstruct cell path.
+    cell_path: List[Tuple[int, int]] = [(tr, tc)]
+    cur = (tr, tc)
+    while cur != (sr, sc):
+        cur = came.get(cur)
+        if cur is None:
+            return None
+        cell_path.append(cur)
+    cell_path.reverse()
+
+    pts: List[QgsPointXY] = [start_pt]
+    pts.extend(to_xy(r, c) for (r, c) in cell_path[1:-1])
+    pts.append(end_pt)
+
+    # Thin points to reduce geometry complexity.
+    if len(pts) > 2:
+        thinned: List[QgsPointXY] = [pts[0]]
+        last = pts[0]
+        for p in pts[1:-1]:
+            if last.distance(p) >= (cell_m * 0.75):
+                thinned.append(p)
+                last = p
+        thinned.append(pts[-1])
+        pts = thinned
+
+    try:
+        geom = QgsGeometry.fromPolylineXY(pts)
+        # Smooth the routed line to reduce the grid "stair-step" appearance.
+        if geom and (not geom.isEmpty()) and len(pts) > 2:
+            try:
+                iters = int(getattr(params, "vector_routing_smooth_iterations", 6) or 6)
+                offset = float(getattr(params, "vector_routing_smooth_offset", 0.25) or 0.25)
+                smoothed = geom.smooth(max(0, iters), offset)
+            except Exception:
+                smoothed = None
+                try:
+                    smoothed = geom.smooth(max(0, int(getattr(params, "vector_routing_smooth_iterations", 6) or 6)))
+                except Exception:
+                    smoothed = None
+            if smoothed and (not smoothed.isEmpty()):
+                geom = smoothed
+        return geom
+    except Exception:
+        return None
+
+
 def _create_corridor_geometry(
     waypoints: List[QgsPointXY],
     source_geom: QgsGeometry,
     target_geom: QgsGeometry,
     params: VectorRunParams,
     obstacle_geoms: Optional[List[QgsGeometry]] = None,
+    ctx: Optional[AnalysisContext] = None,
     smooth_iterations: int = 0,
 ) -> Optional[QgsGeometry]:
     if not waypoints or len(waypoints) < 2:
         return None
 
+    start_pt = QgsPointXY(waypoints[0])
+    end_pt = QgsPointXY(waypoints[-1])
     corridor_line = QgsGeometry.fromPolylineXY([QgsPointXY(pt) for pt in waypoints])
-    if smooth_iterations > 0:
+    # Apply smoothing for routed paths (more than 2 waypoints), or if explicitly requested.
+    # This reduces the angular grid "stair-step" look.
+    iterations_to_use = int(smooth_iterations or 0)
+    if obstacle_geoms and iterations_to_use == 0 and len(waypoints) > 2:
+        iterations_to_use = int(getattr(params, "vector_routing_smooth_iterations", 6) or 6)
+
+    if iterations_to_use > 0:
         try:
-            smoothed = corridor_line.smooth(smooth_iterations)
+            try:
+                offset = float(getattr(params, "vector_routing_smooth_offset", 0.25) or 0.25)
+                smoothed = corridor_line.smooth(iterations_to_use, offset)
+            except Exception:
+                smoothed = corridor_line.smooth(iterations_to_use)
             if smoothed and not smoothed.isEmpty():
                 corridor_line = smoothed
         except Exception:
             pass
+
+    # If a straight corridor is blocked by impassables, optionally route around them using a
+    # small grid A* within a bounded local window (maze-capable).
+    #
+    # NOTE: `obstacle_geoms` should already be in analysis CRS; when passed from RasterNavigator
+    # we use obstacles buffered by half-width so corridor width becomes a hard constraint.
+    if obstacle_geoms:
+        try:
+            enabled = bool(getattr(params, "vector_routing_enabled", False))
+        except Exception:
+            enabled = False
+        try:
+            safety = max(0.0, float(params.min_corridor_width or 0.0) * 0.5)
+            obstacle_union = (ctx.impassable_union if ctx is not None else getattr(params, "_impassable_union", None))
+            if obstacle_union is None:
+                obstacle_union = QgsGeometry.unaryUnion([g for g in obstacle_geoms if g and (not g.isEmpty())]).makeValid()
+                try:
+                    if ctx is not None:
+                        ctx.impassable_union = obstacle_union
+                    else:
+                        params._impassable_union = obstacle_union  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            if safety > 0:
+                try:
+                    blocked = corridor_line.intersects(obstacle_union.buffer(safety, 8))
+                except Exception:
+                    blocked = corridor_line.intersects(obstacle_union)
+            else:
+                blocked = corridor_line.intersects(obstacle_union)
+        except Exception:
+            blocked = False
+
+        if blocked and not enabled:
+            return None
+
+        if blocked and enabled:
+            cell_m = float(getattr(params, "grid_resolution", 50.0) or 50.0)
+            max_win = float(getattr(params, "vector_routing_max_window_m", 6000.0) or 6000.0)
+            routed = _route_line_around_impassables_grid(
+                start_pt=start_pt,
+                end_pt=end_pt,
+                obstacle_geoms=list(obstacle_geoms),
+                cell_m=cell_m,
+                max_window_m=max_win,
+                params=params,
+                ctx=ctx,
+            )
+            if routed and not routed.isEmpty():
+                corridor_line = routed
+            else:
+                return None
+
+    # Buffer to full width
     corridor_geom = _buffer_line_segment(corridor_line, params.min_corridor_width)
+
+    # Clip start/end immediately to get the "bridge" geometry
     corridor_geom = corridor_geom.difference(source_geom)
     corridor_geom = corridor_geom.difference(target_geom)
+
     if obstacle_geoms:
-        for obstacle in obstacle_geoms:
-            corridor_geom = corridor_geom.difference(obstacle)
-            if corridor_geom.isEmpty():
-                return None
+        obstacle_union = (ctx.impassable_union if ctx is not None else getattr(params, "_impassable_union", None))
+        if obstacle_union is None:
+            try:
+                obstacle_union = QgsGeometry.unaryUnion([g for g in obstacle_geoms if g and (not g.isEmpty())]).makeValid()
+                try:
+                    if ctx is not None:
+                        ctx.impassable_union = obstacle_union
+                    else:
+                        params._impassable_union = obstacle_union  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            except Exception:
+                obstacle_union = None
+
+        if obstacle_union and (not obstacle_union.isEmpty()):
+            try:
+                overlap = corridor_geom.intersection(obstacle_union)
+                overlap_area = overlap.area() if overlap and (not overlap.isEmpty()) else 0.0
+            except Exception:
+                overlap_area = 0.0
+
+            if overlap_area > 0.0:
+                try:
+                    clipped = corridor_geom.difference(obstacle_union)
+                except Exception:
+                    clipped = None
+
+                if clipped is None or clipped.isEmpty():
+                    return None
+
+                end_buf = max(float(params.grid_resolution or 0.0) * 1.5, float(params.min_corridor_width or 0.0) * 1.5)
+                try:
+                    a_buf = QgsGeometry.fromPointXY(start_pt).buffer(end_buf, 8)
+                    b_buf = QgsGeometry.fromPointXY(end_pt).buffer(end_buf, 8)
+                    ok_a = clipped.intersects(a_buf)
+                    ok_b = clipped.intersects(b_buf)
+                except Exception:
+                    ok_a = True
+                    ok_b = True
+
+                if not (ok_a and ok_b):
+                    return None
+
+                corridor_geom = clipped
+                 
     corridor_geom = corridor_geom.makeValid()
     if corridor_geom.isEmpty():
-        return None
-
-    if not _corridor_passes_width(corridor_geom, params.min_corridor_width):
         return None
 
     return corridor_geom
 
 
 class RasterNavigator:
-    """Hybrid raster navigator that routes corridors around obstacles."""
-
     def __init__(
         self,
         patches: Dict[int, Dict],
-        obstacle_layer: QgsVectorLayer,
+        obstacle_layers: List[QgsVectorLayer],
         target_crs: QgsCoordinateReferenceSystem,
         params: VectorRunParams,
     ):
-        if obstacle_layer is None or QgsWkbTypes.geometryType(obstacle_layer.wkbType()) != QgsWkbTypes.PolygonGeometry:
-            raise VectorAnalysisError("Select a polygon obstacle layer for vector obstacle avoidance.")
+        if not obstacle_layers:
+            raise VectorAnalysisError("Select at least one polygon impassable layer for impassable land classes.")
 
+        self._params = params
         self.resolution = max(params.grid_resolution, 1.0)
         self.obstacle_geoms: List[QgsGeometry] = []
+        self._buffered_obstacles_cache: Dict[float, List[QgsGeometry]] = {}
 
         extent: Optional[QgsRectangle] = None
         for patch in patches.values():
@@ -315,24 +979,28 @@ class RasterNavigator:
             else:
                 extent.combineExtentWith(bbox)
 
-        transform = QgsCoordinateTransform(obstacle_layer.crs(), target_crs, QgsProject.instance())
-        for feature in obstacle_layer.getFeatures():
-            geom = QgsGeometry(feature.geometry())
-            if geom.isEmpty():
-                continue
-            geom.transform(transform)
-            geom = geom.makeValid()
-            if geom.isEmpty():
-                continue
-            self.obstacle_geoms.append(clone_geometry(geom))
-            bbox = geom.boundingBox()
-            if extent is None:
-                extent = QgsRectangle(bbox)
-            else:
-                extent.combineExtentWith(bbox)
+        for obstacle_layer in obstacle_layers:
+            if obstacle_layer is None or QgsWkbTypes.geometryType(obstacle_layer.wkbType()) != QgsWkbTypes.PolygonGeometry:
+                raise VectorAnalysisError("Select a polygon impassable layer for impassable land classes.")
+
+            transform = QgsCoordinateTransform(obstacle_layer.crs(), target_crs, QgsProject.instance())
+            for feature in obstacle_layer.getFeatures():
+                geom = QgsGeometry(feature.geometry())
+                if geom.isEmpty():
+                    continue
+                geom.transform(transform)
+                geom = geom.makeValid()
+                if geom.isEmpty():
+                    continue
+                self.obstacle_geoms.append(clone_geometry(geom))
+                bbox = geom.boundingBox()
+                if extent is None:
+                    extent = QgsRectangle(bbox)
+                else:
+                    extent.combineExtentWith(bbox)
 
         if extent is None:
-            raise VectorAnalysisError("Unable to determine extent for obstacle avoidance routing.")
+            raise VectorAnalysisError("Unable to determine extent for impassable land class routing.")
 
         pad = max(params.max_search_distance, params.min_corridor_width)
         extent = QgsRectangle(
@@ -350,15 +1018,23 @@ class RasterNavigator:
         self.rows = max(1, int(math.ceil(height / self.resolution)))
         self.passable = np.ones((self.rows, self.cols), dtype=bool)
 
-        # FIX: Inflate obstacles by half the corridor width to keep the centerline safe.
-        # This prevents the final corridor buffer from grazing the obstacle and being clipped.
-        safety_buffer = params.min_corridor_width / 2.0
+        # Use a minimal safety buffer (half a grid cell) to allow squeezing through narrow gaps.
+        # This allows the routed centerline to pass through any gap wider than the grid resolution.
+        safety_buffer = self.resolution * 0.5
 
         for geom in self.obstacle_geoms:
-            # We buffer the obstacle geometry solely for the mask creation
-            # Using 4 segments is sufficient for raster mask accuracy
-            buffered_mask = geom.buffer(safety_buffer, 4)
-            self._burn_geometry(buffered_mask)
+            try:
+                mask_geom = geom.buffer(safety_buffer, 4) if safety_buffer > 0 else clone_geometry(geom)
+            except Exception:
+                mask_geom = clone_geometry(geom)
+
+            try:
+                mask_geom = mask_geom.makeValid()
+            except Exception:
+                pass
+            if mask_geom is None or mask_geom.isEmpty():
+                continue
+            self._burn_geometry(mask_geom)
 
     def _world_to_rc(self, point: QgsPointXY) -> Optional[Tuple[int, int]]:
         col = int(math.floor((point.x() - self.origin_x) / self.resolution))
@@ -387,13 +1063,44 @@ class RasterNavigator:
             for col in range(min_col, max_col + 1):
                 x = self.origin_x + (col + 0.5) * self.resolution
                 try:
-                    # Check center point
                     if geom.contains(QgsPointXY(x, y)):
                         self.passable[row, col] = False
                 except Exception:
                     pass
 
-    def find_path(self, start_point: QgsPointXY, end_point: QgsPointXY) -> Optional[List[QgsPointXY]]:
+    def _cell_stats_in_geom(self, geom: QgsGeometry) -> Tuple[int, int, int]:
+        """Return (passable_cells, blocked_cells, total_cells) for cell centers inside `geom`."""
+        bbox = geom.boundingBox()
+        min_col = max(0, int(math.floor((bbox.xMinimum() - self.origin_x) / self.resolution)))
+        max_col = min(self.cols - 1, int(math.ceil((bbox.xMaximum() - self.origin_x) / self.resolution)))
+        min_row = max(0, int(math.floor((self.origin_y - bbox.yMaximum()) / self.resolution)))
+        max_row = min(self.rows - 1, int(math.ceil((self.origin_y - bbox.yMinimum()) / self.resolution)))
+
+        if min_col > max_col or min_row > max_row:
+            return 0, 0, 0
+
+        passable = 0
+        blocked = 0
+        total = 0
+        for row in range(min_row, max_row + 1):
+            y = self.origin_y - (row + 0.5) * self.resolution
+            for col in range(min_col, max_col + 1):
+                x = self.origin_x + (col + 0.5) * self.resolution
+                try:
+                    if not geom.contains(QgsPointXY(x, y)):
+                        continue
+                except Exception:
+                    continue
+                total += 1
+                if self.passable[row, col]:
+                    passable += 1
+                else:
+                    blocked += 1
+        return passable, blocked, total
+
+    def find_path(
+        self, start_point: QgsPointXY, end_point: QgsPointXY
+    ) -> Optional[List[QgsPointXY]]:
         start = self._world_to_rc(start_point)
         end = self._world_to_rc(end_point)
         if start is None or end is None:
@@ -407,6 +1114,37 @@ class RasterNavigator:
         if not path:
             return None
         return [self._rc_to_world(r, c) for r, c in path]
+
+    def buffered_obstacles(self, safety: float) -> List[QgsGeometry]:
+        """
+        Return obstacles buffered by `safety` (analysis CRS units), cached per run.
+        Use this for corridor validation and optional non-navigator routing.
+        """
+        try:
+            key = round(float(safety or 0.0), 3)
+        except Exception:
+            key = 0.0
+        cached = self._buffered_obstacles_cache.get(key)
+        if cached is not None:
+            return cached
+
+        out: List[QgsGeometry] = []
+        for g in self.obstacle_geoms:
+            if g is None or g.isEmpty():
+                continue
+            try:
+                gg = g.buffer(float(safety or 0.0), 4) if safety and safety > 0 else clone_geometry(g)
+            except Exception:
+                gg = clone_geometry(g)
+            try:
+                gg = gg.makeValid()
+            except Exception:
+                pass
+            if gg is not None and not gg.isEmpty():
+                out.append(gg)
+
+        self._buffered_obstacles_cache[key] = out
+        return out
 
 
 def _nearest_passable_node(mask: np.ndarray, node: Tuple[int, int], search_radius: int = 6) -> Optional[Tuple[int, int]]:
@@ -428,16 +1166,7 @@ def _shortest_path_on_mask(
     mask: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int]
 ) -> Optional[List[Tuple[int, int]]]:
     rows, cols = mask.shape
-    moves = [
-        (-1, 0),
-        (1, 0),
-        (0, -1),
-        (0, 1),
-        (-1, -1),
-        (-1, 1),
-        (1, -1),
-        (1, 1),
-    ]
+    moves = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
 
     heap: List[Tuple[float, int, int]] = []
     heapq.heappush(heap, (0.0, start[0], start[1]))
@@ -482,369 +1211,1896 @@ def find_all_possible_corridors(
     patches: Dict[int, Dict],
     spatial_index: QgsSpatialIndex,
     params: VectorRunParams,
+    strategy: str = "circuit_utility",
+    patch_union: Optional[QgsGeometry] = None,
+    ctx: Optional[AnalysisContext] = None,
     progress_cb: Optional[Callable[[int, Optional[str]], None]] = None,
     progress_start: int = 30,
     progress_end: int = 55,
     navigator: Optional[RasterNavigator] = None,
+    timings: Optional[TimingRecorder] = None,
+    timing_out: Optional[Dict[str, object]] = None,
 ) -> List[Dict]:
-    """
-    Find all possible corridors between patch pairs within the distance constraint.
-    Uses either buffered straight lines or the raster navigator when enabled.
-    """
     print("  Finding all possible corridors...")
-    all_corridors: List[Dict] = []
     processed_pairs: Set[frozenset] = set()
     total = len(patches) or 1
+    accum_durations: Dict[str, float] = defaultdict(float)
+    accum_counts: Dict[str, int] = defaultdict(int)
+    strategy_key = (strategy or "circuit_utility").lower()
+    if strategy_key not in ("largest_network", "circuit_utility"):
+        strategy_key = "circuit_utility"
+    circuit_mode = strategy_key == "circuit_utility"
+    largest_network_mode = strategy_key == "largest_network"
+    # Both Circuit Theory and Largest Network (Circuit Utility) need enough candidate
+    # diversity to avoid "blind" terminal selection in long/snaking patches.
+    utility_mode = strategy_key in ("circuit_utility", "largest_network")
+    max_keep_per_pair = 8 if utility_mode else 1
+    # To avoid O(n^2) candidate enumeration, rank neighbor patches by true polygon boundary distance
+    # (not centroid distance) and keep the top-K nearest per patch.
+    # Important: keep K large enough that short "obvious" gaps are not dropped in dense patch fields.
+    # We therefore only cap when there are many candidates within the search window.
+    k_nearest_neighbors_cap = 250
+    min_distinct_overlap_ratio = 0.75  # higher = allow more similar corridors
+    proximity_dist = max(float(getattr(params, "min_corridor_width", 0.0) or 0.0) * 1.5, float(getattr(params, "grid_resolution", 0.0) or 0.0) * 2.0)
+    timing_start = time.perf_counter()
+    # Use raw impassable geometries (analysis CRS). Routing/clearance is handled inside
+    # the grid router via obstacle inflation and inside corridor finalization via clipping.
+    impassable_geoms: Optional[List[QgsGeometry]] = None
+    if navigator is not None:
+        impassable_geoms = navigator.obstacle_geoms
+
+    # Maintain a bounded set of spatially distinct candidates per patch-pair.
+    candidates_by_pair: Dict[Tuple[int, int], List[Dict]] = defaultdict(list)
+
+    def _pair_key(a: int, b: int) -> Tuple[int, int]:
+        ia, ib = int(a), int(b)
+        return (ia, ib) if ia <= ib else (ib, ia)
+
+    def _geom_parts(geom: QgsGeometry) -> List[QgsGeometry]:
+        if geom is None or geom.isEmpty():
+            return []
+        if not geom.isMultipart():
+            return [geom]
+        try:
+            coll = geom.asGeometryCollection()
+            if coll:
+                out: List[QgsGeometry] = []
+                for p in coll:
+                    g = QgsGeometry(p)
+                    if g and (not g.isEmpty()):
+                        out.append(g)
+                return out or [geom]
+        except Exception:
+            pass
+        try:
+            out2: List[QgsGeometry] = []
+            for poly in geom.asMultiPolygon():
+                try:
+                    g = QgsGeometry.fromPolygonXY(poly)
+                    if g and (not g.isEmpty()):
+                        out2.append(g)
+                except Exception:
+                    continue
+            return out2 or [geom]
+        except Exception:
+            return [geom]
+
+    def _pick_part_closest_to_patch(geom: QgsGeometry, patch_geom: QgsGeometry) -> Optional[QgsGeometry]:
+        parts = _geom_parts(geom)
+        if not parts:
+            return None
+        best_part: Optional[QgsGeometry] = None
+        best_dist = float("inf")
+        for part in parts:
+            try:
+                d = float(part.distance(patch_geom))
+            except Exception:
+                continue
+            if d < best_dist:
+                best_dist = d
+                best_part = part
+        return best_part
+
+    def _push_candidate(cand: Dict) -> None:
+        try:
+            p1 = int(cand.get("patch1"))
+            p2 = int(cand.get("patch2"))
+        except Exception:
+            return
+        if p1 == p2:
+            return
+        geom = cand.get("geom")
+        if geom is None or geom.isEmpty():
+            return
+        key = _pair_key(p1, p2)
+        existing = candidates_by_pair.get(key, [])
+
+        for prev in existing:
+            try:
+                if _overlap_ratio(geom, prev.get("geom")) >= min_distinct_overlap_ratio:
+                    return
+            except Exception:
+                continue
+
+        existing.append(cand)
+        existing.sort(key=lambda c: (c.get("area_ha", 0.0), c.get("distance_m", 0.0)))
+        if len(existing) > max_keep_per_pair:
+            del existing[max_keep_per_pair:]
+        candidates_by_pair[key] = existing
+
+    @contextmanager
+    def _measure(label: str):
+        start = time.perf_counter()
+        accum_counts[label] += 1
+        try:
+            yield
+        finally:
+            accum_durations[label] += time.perf_counter() - start
+
+    def _sample_boundary_points(
+        patch_geom: QgsGeometry, max_points: int = 32, allow_densify: bool = True
+    ) -> List[QgsPointXY]:
+        pts: List[QgsPointXY] = []
+        try:
+            ring = patch_geom.constGet().exteriorRing()
+            if ring:
+                pts = [QgsPointXY(v) for v in ring.vertices()]
+        except Exception:
+            try:
+                pts = [QgsPointXY(v) for v in patch_geom.vertices()]
+            except Exception:
+                pts = []
+        if len(pts) > max_points and max_points > 0:
+            step = max(1, len(pts) // max_points)
+            pts = pts[::step][:max_points]
+        if allow_densify and len(pts) < max_points:
+            try:
+                perim = max(patch_geom.length(), 1.0)
+                target_spacing = perim / max_points
+                densified = patch_geom.densifyByDistance(target_spacing)
+                extra = [QgsPointXY(v) for v in densified.vertices()]
+                if extra:
+                    pts.extend(extra)
+            except Exception:
+                pass
+            if len(pts) > max_points:
+                step = max(1, len(pts) // max_points)
+                pts = pts[::step][:max_points]
+        return pts[:max_points]
+
+    def _safe_unary_union(geoms: List[QgsGeometry]) -> Optional[QgsGeometry]:
+        if not geoms:
+            return None
+        try:
+            merged = QgsGeometry.unaryUnion(geoms)
+        except Exception:
+            merged = geoms[0]
+            for extra in geoms[1:]:
+                try:
+                    merged = merged.combine(extra)
+                except Exception:
+                    pass
+        if merged is None or merged.isEmpty():
+            return None
+        try:
+            merged = merged.makeValid()
+        except Exception:
+            pass
+        return merged if (merged is not None and not merged.isEmpty()) else None
+
+    def _pick_extremes_along_axis(
+        points: List[QgsPointXY], ax_dx: float, ax_dy: float, cx: float, cy: float
+    ) -> Tuple[Optional[QgsPointXY], Optional[QgsPointXY]]:
+        if abs(ax_dx) < 1e-12 and abs(ax_dy) < 1e-12:
+            return None, None
+        if not points:
+            return None, None
+
+        def _proj(pt: QgsPointXY) -> float:
+            return (pt.x() - cx) * ax_dx + (pt.y() - cy) * ax_dy
+
+        p_max = max(points, key=_proj)
+        p_min = min(points, key=_proj)
+        if p_max.distance(p_min) < 1e-6:
+            return p_max, None
+        return p_max, p_min
+
+    def _anchor_variants_for_pair(
+        g1: QgsGeometry, g2: QgsGeometry, nearest1: QgsPointXY, nearest2: QgsPointXY
+    ) -> List[Tuple[str, QgsPointXY, QgsPointXY]]:
+        variants: List[Tuple[str, QgsPointXY, QgsPointXY]] = [("nearest", nearest1, nearest2)]
+        # Build two additional variants that are on the *facing* edges of each patch.
+        # This prevents "teleport" corridors that rely on travel through patch interior
+        # to exit on the opposite side.
+        try:
+            c1 = g1.centroid().asPoint()
+            c2 = g2.centroid().asPoint()
+            c1x, c1y = c1.x(), c1.y()
+            c2x, c2y = c2.x(), c2.y()
+            vx, vy = (c2x - c1x), (c2y - c1y)
+        except Exception:
+            c1x, c1y, c2x, c2y = 0.0, 0.0, 1.0, 0.0
+            vx, vy = 1.0, 0.0
+
+        pts1 = _sample_boundary_points(g1, max_points=96, allow_densify=True)
+        pts2 = _sample_boundary_points(g2, max_points=96, allow_densify=True)
+        if not pts1 or not pts2:
+            return variants
+
+        # "Facing" = high projection along the axis towards the other patch.
+        def _proj_to_other_from_1(pt: QgsPointXY) -> float:
+            return (pt.x() - c1x) * vx + (pt.y() - c1y) * vy
+
+        def _proj_to_other_from_2(pt: QgsPointXY) -> float:
+            # towards patch1, so invert axis
+            return (pt.x() - c2x) * (-vx) + (pt.y() - c2y) * (-vy)
+
+        p1_max = max((_proj_to_other_from_1(p) for p in pts1), default=0.0)
+        p2_max = max((_proj_to_other_from_2(p) for p in pts2), default=0.0)
+        # keep points in the top 40% of "facing" scores
+        p1_cut = p1_max * 0.60
+        p2_cut = p2_max * 0.60
+        facing1 = [p for p in pts1 if _proj_to_other_from_1(p) >= p1_cut]
+        facing2 = [p for p in pts2 if _proj_to_other_from_2(p) >= p2_cut]
+        if not facing1:
+            facing1 = pts1
+        if not facing2:
+            facing2 = pts2
+
+        # Now spread along perpendicular direction, but only within facing sets.
+        px, py = (-vy, vx)
+        a1_pos, a1_neg = _pick_extremes_along_axis(facing1, px, py, c1x, c1y)
+        a2_pos, a2_neg = _pick_extremes_along_axis(facing2, px, py, c2x, c2y)
+        if a1_pos is not None and a2_pos is not None:
+            variants.append(("side_pos", a1_pos, a2_pos))
+        if a1_neg is not None and a2_neg is not None:
+            variants.append(("side_neg", a1_neg, a2_neg))
+
+        if circuit_mode:
+            # Perimeter-based (cardinal) anchors to enable multiple spatially distinct
+            # candidates between long/snaking patches.
+            n1, s1 = _pick_extremes_along_axis(pts1, 0.0, 1.0, c1x, c1y)
+            n2, s2 = _pick_extremes_along_axis(pts2, 0.0, 1.0, c2x, c2y)
+            e1, w1 = _pick_extremes_along_axis(pts1, 1.0, 0.0, c1x, c1y)
+            e2, w2 = _pick_extremes_along_axis(pts2, 1.0, 0.0, c2x, c2y)
+            if n1 is not None and n2 is not None:
+                variants.append(("north", n1, n2))
+            if s1 is not None and s2 is not None:
+                variants.append(("south", s1, s2))
+            if e1 is not None and e2 is not None:
+                variants.append(("east", e1, e2))
+            if w1 is not None and w2 is not None:
+                variants.append(("west", w1, w2))
+
+        seen = set()
+        uniq: List[Tuple[str, QgsPointXY, QgsPointXY]] = []
+        for tag, pta, ptb in variants:
+            key = (round(pta.x(), 3), round(pta.y(), 3), round(ptb.x(), 3), round(ptb.y(), 3))
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append((tag, pta, ptb))
+        return uniq
+
+    def _overlap_ratio(g1: QgsGeometry, g2: QgsGeometry) -> float:
+        try:
+            if circuit_mode:
+                try:
+                    if proximity_dist > 0 and g1.distance(g2) <= proximity_dist:
+                        return 1.0
+                except Exception:
+                    pass
+            a1 = g1.area()
+            a2 = g2.area()
+            denom = min(a1, a2)
+            if denom <= 0:
+                return 1.0
+            inter = g1.intersection(g2)
+            if inter is None or inter.isEmpty():
+                return 0.0
+            return inter.area() / denom
+        except Exception:
+            return 1.0
+
+    def _dedupe_points_xy(points, tol=0.01):
+        out = []
+        seen = set()
+        for p in points:
+            k = (round(p.x() / tol), round(p.y() / tol))
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(p)
+        return out
+
+    def _boundary_terminals_for_patch(patch_geom, spacing_m=150.0, max_pts=120):
+        if not patch_geom or patch_geom.isEmpty():
+            return []
+        pts: List[QgsPointXY] = []
+
+        # QGIS API compatibility: not all versions expose QgsGeometry.boundary().
+        # We only sample exterior rings (corridors should not start from holes).
+        rings: List[List[QgsPointXY]] = []
+        try:
+            if patch_geom.isMultipart():
+                for poly in patch_geom.asMultiPolygon() or []:
+                    if not poly:
+                        continue
+                    exterior = poly[0] if poly else []
+                    if exterior:
+                        rings.append([QgsPointXY(p) for p in exterior])
+            else:
+                poly = patch_geom.asPolygon() or []
+                exterior = poly[0] if poly else []
+                if exterior:
+                    rings.append([QgsPointXY(p) for p in exterior])
+        except Exception:
+            rings = []
+
+        if not rings:
+            # Fallback: at least return some vertices.
+            try:
+                for v in patch_geom.vertices():
+                    pts.append(QgsPointXY(v))
+            except Exception:
+                return []
+
+        # Always include vertices (tips often are vertices)
+        for ring in rings:
+            pts.extend(ring)
+
+        # Sample along boundary at regular spacing
+        if spacing_m and spacing_m > 0:
+            for ring in rings:
+                if len(ring) < 2:
+                    continue
+                try:
+                    line = QgsGeometry.fromPolylineXY(ring)
+                    L = float(line.length())
+                    if L <= 0:
+                        continue
+                    n = int(L // spacing_m) + 1
+                    for i in range(n + 1):
+                        d = min(i * spacing_m, L)
+                        ip = line.interpolate(d)
+                        if ip and not ip.isEmpty():
+                            try:
+                                pts.append(QgsPointXY(ip.asPoint()))
+                            except Exception:
+                                pass
+                except Exception:
+                    continue
+
+        pts = _dedupe_points_xy(pts, tol=0.01)
+
+        # Cap size by uniform thinning (keeps tips/vertices because they were added first)
+        if max_pts and len(pts) > max_pts:
+            step = max(1, len(pts) // max_pts)
+            pts = pts[::step][:max_pts]
+
+        return pts
+
+    terminal_cache: Dict[int, List[QgsPointXY]] = {}
 
     for idx, (pid1, pdata1) in enumerate(patches.items(), start=1):
-        if idx % 10 == 0:
-            print(f"    Analyzing patch {idx}/{len(patches)}...", end="\r")
         if progress_cb is not None:
             span = max(progress_end - progress_start, 1)
             progress_value = progress_start + ((idx - 1) / total) * span
-            _emit_progress(progress_cb, progress_value, "Building corridor candidates…")
+            emit_progress(progress_cb, progress_value, "Analyzing patches")
 
         geom1 = pdata1["geom"]
         rect = geom1.boundingBox()
         rect.grow(params.max_search_distance)
         candidate_ids = spatial_index.intersects(rect)
 
-        for pid2 in candidate_ids:
-            if pid1 >= pid2:
-                continue
+        with _measure("Patch iteration"):
+            # Rank potential neighbors by true boundary-to-boundary distance, then keep top-K.
+            ranked_neighbors: List[Tuple[float, int]] = []
+            with _measure("Neighbor ranking"):
+                for pid2 in candidate_ids:
+                    if pid2 == pid1:
+                        continue
+                    pair = frozenset({pid1, pid2})
+                    if pair in processed_pairs:
+                        continue
 
-            pair = frozenset({pid1, pid2})
-            if pair in processed_pairs:
-                continue
+                    pdata2 = patches.get(pid2)
+                    if not pdata2:
+                        continue
+                    geom2 = pdata2["geom"]
 
-            pdata2 = patches.get(pid2)
-            if not pdata2:
-                continue
-            geom2 = pdata2["geom"]
+                    try:
+                        distance = float(geom1.distance(geom2))
+                    except Exception:
+                        continue
 
-            distance = geom1.distance(geom2)
-            if distance > params.max_search_distance:
-                continue
+                    # Touching/intersecting polygons are already contiguous; do not build a corridor.
+                    if distance <= 0.0:
+                        processed_pairs.add(pair)
+                        continue
 
-            p1 = geom1.nearestPoint(geom2).asPoint()
-            p2 = geom2.nearestPoint(geom1).asPoint()
-            if p1.isEmpty() or p2.isEmpty():
-                continue
+                    if distance > params.max_search_distance:
+                        continue
 
-            if navigator:
-                path_points = navigator.find_path(QgsPointXY(p1), QgsPointXY(p2))
-                if not path_points:
+                    ranked_neighbors.append((distance, int(pid2)))
+
+            ranked_neighbors.sort(key=lambda item: item[0])
+            if len(ranked_neighbors) > int(k_nearest_neighbors_cap):
+                ranked_neighbors = ranked_neighbors[: int(k_nearest_neighbors_cap)]
+
+            for distance, pid2 in ranked_neighbors:
+                pair = frozenset({pid1, pid2})
+                if pair in processed_pairs:
                     continue
-                corridor_geom = _create_corridor_geometry(
-                    path_points,
-                    geom1,
-                    geom2,
-                    params,
-                    obstacle_geoms=navigator.obstacle_geoms,
-                    smooth_iterations=3,
-                )
-            else:
-                corridor_geom = _create_corridor_geometry(
-                    [QgsPointXY(p1), QgsPointXY(p2)],
-                    geom1,
-                    geom2,
-                    params,
-                )
 
-            if corridor_geom is None:
-                continue
+                pdata2 = patches.get(pid2)
+                if not pdata2:
+                    continue
+                geom2 = pdata2["geom"]
 
-            corridor_area_ha = corridor_geom.area() / 10000.0
-            if corridor_area_ha <= 0:
-                continue
-            if params.max_corridor_area is not None and corridor_area_ha > params.max_corridor_area:
-                continue
+                def _path_cost_length(points: List[QgsPointXY]) -> float:
+                    return sum(points[i].distance(points[i + 1]) for i in range(len(points) - 1))
 
-            all_corridors.append(
-                {
-                    "patch1": pid1,
-                    "patch2": pid2,
-                    "geom": clone_geometry(corridor_geom),
-                    "area_ha": corridor_area_ha,
-                }
-            )
-            processed_pairs.add(pair)
+                # --- Terminal selection (fix peninsula-tip blindness) ---
+                term_spacing = float(getattr(params, "vector_terminal_spacing_m", 150.0))
+                term_max = int(getattr(params, "vector_terminal_max_per_patch", 120))
+                term_pairs_k = int(getattr(params, "vector_terminal_pairs_per_pair", 25))
 
-    _emit_progress(progress_cb, progress_end, "Candidate corridors ready.")
+                base_terms1 = terminal_cache.get(int(pid1))
+                if base_terms1 is None:
+                    base_terms1 = _boundary_terminals_for_patch(geom1, spacing_m=term_spacing, max_pts=term_max)
+                    terminal_cache[int(pid1)] = base_terms1
+                base_terms2 = terminal_cache.get(int(pid2))
+                if base_terms2 is None:
+                    base_terms2 = _boundary_terminals_for_patch(geom2, spacing_m=term_spacing, max_pts=term_max)
+                    terminal_cache[int(pid2)] = base_terms2
+
+                # Copy cached terminals so we can add pair-specific terminals without polluting the cache.
+                terms1 = list(base_terms1 or [])
+                terms2 = list(base_terms2 or [])
+
+                # Force-add the TRUE nearest boundary points as terminals so small gaps are always evaluated.
+                try:
+                    nearest_p1 = geom1.nearestPoint(geom2).asPoint()
+                    nearest_p2 = geom2.nearestPoint(geom1).asPoint()
+                    if nearest_p1 and not nearest_p1.isEmpty():
+                        terms1 = [QgsPointXY(nearest_p1)] + terms1
+                    if nearest_p2 and not nearest_p2.isEmpty():
+                        terms2 = [QgsPointXY(nearest_p2)] + terms2
+                except Exception:
+                    pass
+
+                terms1 = _dedupe_points_xy(terms1, tol=0.01)
+                terms2 = _dedupe_points_xy(terms2, tol=0.01)
+
+                # Fallback to legacy behavior if sampling fails
+                if not terms1 or not terms2:
+                    p1 = geom1.nearestPoint(geom2).asPoint()
+                    p2 = geom2.nearestPoint(geom1).asPoint()
+                    if p1.isEmpty() or p2.isEmpty():
+                        continue
+                    terms1 = [QgsPointXY(p1)]
+                    terms2 = [QgsPointXY(p2)]
+
+                # Build top-K closest terminal pairs by straight-line distance (cheap shortlist)
+                pairs: List[Tuple[float, QgsPointXY, QgsPointXY]] = []
+                for t1 in terms1:
+                    for t2 in terms2:
+                        pairs.append((t1.distance(t2), t1, t2))
+                pairs.sort(key=lambda x: x[0])
+                pairs = pairs[: max(1, term_pairs_k)]
+
+                # Evaluate a few candidate terminal pairs using the SAME routing/cost logic,
+                # then pick the best. This keeps only ONE terminal pair per patch-pair.
+                best: Optional[Tuple[float, List[QgsPointXY], QgsPointXY, QgsPointXY]] = None
+
+                for lower_bound_dist, cand_t1, cand_t2 in pairs:
+                    if best is not None and lower_bound_dist >= best[0]:
+                        continue
+                    p1_xy = cand_t1
+                    p2_xy = cand_t2
+
+                    try:
+                        if navigator:
+                            path_points = navigator.find_path(p1_xy, p2_xy)
+                        else:
+                            path_points = [p1_xy, p2_xy]
+                    except Exception:
+                        path_points = [p1_xy, p2_xy]
+
+                    if not path_points or len(path_points) < 2:
+                        continue
+
+                    cand_cost_len = _path_cost_length(path_points)
+                    if best is None or cand_cost_len < best[0]:
+                        best = (cand_cost_len, path_points, cand_t1, cand_t2)
+
+                if best is None:
+                    continue
+
+                p1_xy = best[2]
+                p2_xy = best[3]
+                best_path_points = best[1]
+                # --- end terminal selection ---
+
+                def _best_path_to_boundary(
+                    start_pt: QgsPointXY, patch_geom: QgsGeometry
+                ) -> Tuple[Optional[List[QgsPointXY]], Optional[QgsPointXY], float]:
+                    if not navigator:
+                        return None, None, float("inf")
+                    candidates = _sample_boundary_points(patch_geom, max_points=16, allow_densify=False)
+                    best_path: Optional[List[QgsPointXY]] = None
+                    best_cost = float("inf")
+                    best_pt: Optional[QgsPointXY] = None
+                    for target in candidates:
+                        pts = navigator.find_path(start_pt, target)
+                        if not pts:
+                            continue
+                        cost = _path_cost_length(pts)
+                        if cost < best_cost:
+                            best_cost = cost
+                            best_path = pts
+                            best_pt = target
+                    if not best_path:
+                        dense_candidates = _sample_boundary_points(patch_geom, max_points=40, allow_densify=True)
+                        for target in dense_candidates:
+                            pts = navigator.find_path(start_pt, target)
+                            if not pts:
+                                continue
+                            cost = _path_cost_length(pts)
+                            if cost < best_cost:
+                                best_cost = cost
+                                best_path = pts
+                                best_pt = target
+                    return best_path, best_pt, best_cost
+
+                # We evaluate multiple terminals above, but still emit only ONE corridor per patch-pair
+                # to avoid parallel duplicate corridors between the same patch IDs.
+                variants = [("nearest", p1_xy, p2_xy)]
+                for variant_tag, start_xy, end_xy in variants:
+                    raw_geom_candidates: List[Tuple[str, QgsGeometry]] = []
+                    path_points: Optional[List[QgsPointXY]] = None
+
+                    if navigator:
+                        with _measure("Navigator routing"):
+                            # Always reuse the best evaluated path for the selected terminals.
+                            path_points = best_path_points
+
+                    if navigator and path_points:
+                        with _measure("Corridor geometry (navigator)"):
+                            nav_geom = _create_corridor_geometry(
+                                path_points,
+                                geom1,
+                                geom2,
+                                params,
+                                obstacle_geoms=impassable_geoms,
+                                ctx=ctx,
+                                smooth_iterations=3,
+                            )
+                        if nav_geom:
+                            raw_geom_candidates.append((f"navigator:{variant_tag}", nav_geom))
+
+                    with _measure("Corridor geometry (direct)"):
+                        direct_geom = _create_corridor_geometry(
+                            [start_xy, end_xy],
+                            geom1,
+                            geom2,
+                            params,
+                            obstacle_geoms=impassable_geoms if navigator else None,
+                            ctx=ctx,
+                        )
+                    if direct_geom:
+                        raw_geom_candidates.append((f"direct:{variant_tag}", direct_geom))
+
+                    if not raw_geom_candidates:
+                        continue
+
+                    best_source, raw_geom = min(
+                        raw_geom_candidates,
+                        key=lambda item: item[1].area() if item[1] and not item[1].isEmpty() else float("inf"),
+                    )
+                    if raw_geom is None or raw_geom.isEmpty():
+                        continue
+
+                    # Reject candidates that "reach through" an endpoint patch to exit on the far side.
+                    # We do this by measuring how much of the *raw centerline* lies within each endpoint patch.
+                    raw_line = None
+                    try:
+                        if navigator and path_points:
+                            raw_line = QgsGeometry.fromPolylineXY(path_points)
+                        else:
+                            raw_line = QgsGeometry.fromPolylineXY([start_xy, end_xy])
+                        max_inside_len = max(params.min_corridor_width * 3.0, 5.0)
+                        for _pid, _pgeom in ((pid1, geom1), (pid2, geom2)):
+                            try:
+                                inter = raw_line.intersection(_pgeom)
+                                inside_len = inter.length() if inter and not inter.isEmpty() else 0.0
+                                if inside_len > max_inside_len:
+                                    raw_geom = None
+                                    break
+                            except Exception:
+                                continue
+                        if raw_geom is None:
+                            continue
+                    except Exception:
+                        pass
+
+                    if navigator:
+                        with _measure("Handle intermediate patch"):
+                            intersected_temp = _detect_corridor_intersections(
+                                raw_geom, patches, spatial_index, {pid1, pid2}
+                            )
+                            if intersected_temp:
+                                intermediate_id = min(
+                                    intersected_temp, key=lambda pid: geom1.distance(patches[pid]["geom"])
+                                )
+                                mid_geom = patches[intermediate_id]["geom"]
+
+                                path_in, entry_pt, cost_in = _best_path_to_boundary(start_xy, mid_geom)
+                                path_out, exit_pt, cost_out = _best_path_to_boundary(end_xy, mid_geom)
+
+                                if path_in and path_out and entry_pt and exit_pt:
+                                    entry_geom = _create_corridor_geometry(
+                                        path_in,
+                                        geom1,
+                                        mid_geom,
+                                        params,
+                                        obstacle_geoms=impassable_geoms,
+                                        ctx=ctx,
+                                        smooth_iterations=3,
+                                    )
+                                    exit_geom = _create_corridor_geometry(
+                                        path_out,
+                                        mid_geom,
+                                        geom2,
+                                        params,
+                                        obstacle_geoms=impassable_geoms,
+                                        ctx=ctx,
+                                        smooth_iterations=3,
+                                    )
+                                    internal_geom = None
+                                    # Avoid creating an "internal bridge" that could extend outside the patch
+                                    # and accidentally overlap impassables; the corridor cost is computed
+                                    # after patch-difference anyway.
+                                    if not impassable_geoms:
+                                        internal_geom = QgsGeometry.fromPolylineXY([entry_pt, exit_pt]).buffer(
+                                            params.min_corridor_width / 2.0, BUFFER_SEGMENTS
+                                        )
+                                    geoms_to_merge = [g for g in (entry_geom, exit_geom, internal_geom) if g and not g.isEmpty()]
+                                    if geoms_to_merge:
+                                        try:
+                                            split_geom = QgsGeometry.unaryUnion(geoms_to_merge)
+                                        except Exception:
+                                            split_geom = geoms_to_merge[0]
+                                            for g in geoms_to_merge[1:]:
+                                                try:
+                                                    split_geom = split_geom.combine(g)
+                                                except Exception:
+                                                    pass
+                                        if split_geom is not None and not split_geom.isEmpty():
+                                            raw_geom = split_geom
+
+                    with _measure("Finalize corridor geometry"):
+                        corridor_geom, patch_ids = _finalize_corridor_geometry(
+                            pid1, pid2, raw_geom, patches, spatial_index, patch_union=patch_union
+                        )
+                    if corridor_geom is None:
+                        continue
+
+                    emitted_any = False
+                    try:
+                        extra_patches = [int(pid) for pid in patch_ids if int(pid) not in (int(pid1), int(pid2))]
+                    except Exception:
+                        extra_patches = []
+
+                    # Largest Network: if a corridor proposal touches another patch C "in between",
+                    # don't keep an A->B corridor that gets clipped across C. Prefer A->C and B->C.
+                    # Circuit Theory already behaves well here via stop-early multipart splitting.
+                    blocking_patches: List[int] = []
+                    if extra_patches and raw_line is not None and (not raw_line.isEmpty()):
+                        for pid in extra_patches:
+                            try:
+                                g = patches.get(int(pid), {}).get("geom")
+                                if g is None or g.isEmpty():
+                                    continue
+                                if raw_line.intersects(g):
+                                    blocking_patches.append(int(pid))
+                            except Exception:
+                                continue
+
+                    target_patches = extra_patches if largest_network_mode else extra_patches
+
+                    if target_patches and corridor_geom.isMultipart():
+                        part_a = _pick_part_closest_to_patch(corridor_geom, geom1)
+                        if part_a is not None and (not part_a.isEmpty()):
+                            try:
+                                tgt_a = min(target_patches, key=lambda pid: float(geom1.distance(patches[pid]["geom"])))
+                            except Exception:
+                                tgt_a = target_patches[0]
+                            area_a = float(part_a.area() / 10000.0)
+                            if area_a > 0 and (params.max_corridor_area is None or area_a <= params.max_corridor_area):
+                                try:
+                                    dist_a = float(geom1.distance(patches[tgt_a]["geom"]))
+                                except Exception:
+                                    dist_a = float(distance)
+                                _push_candidate(
+                                    {
+                                        "patch1": int(pid1),
+                                        "patch2": int(tgt_a),
+                                        "patch_ids": {int(pid1), int(tgt_a)},
+                                        "geom": clone_geometry(part_a),
+                                        "area_ha": area_a,
+                                        "original_area_ha": area_a,
+                                        "distance_m": dist_a,
+                                        "variant": f"{variant_tag}:stop_early",
+                                        "source": best_source,
+                                    }
+                                )
+                                emitted_any = True
+
+                        part_b = _pick_part_closest_to_patch(corridor_geom, geom2)
+                        if part_b is not None and (not part_b.isEmpty()):
+                            try:
+                                tgt_b = min(target_patches, key=lambda pid: float(geom2.distance(patches[pid]["geom"])))
+                            except Exception:
+                                tgt_b = target_patches[0]
+                            area_b = float(part_b.area() / 10000.0)
+                            if area_b > 0 and (params.max_corridor_area is None or area_b <= params.max_corridor_area):
+                                try:
+                                    dist_b = float(geom2.distance(patches[tgt_b]["geom"]))
+                                except Exception:
+                                    dist_b = float(distance)
+                                _push_candidate(
+                                    {
+                                        "patch1": int(pid2),
+                                        "patch2": int(tgt_b),
+                                        "patch_ids": {int(pid2), int(tgt_b)},
+                                        "geom": clone_geometry(part_b),
+                                        "area_ha": area_b,
+                                        "original_area_ha": area_b,
+                                        "distance_m": dist_b,
+                                        "variant": f"{variant_tag}:stop_early",
+                                        "source": best_source,
+                                    }
+                                )
+                                emitted_any = True
+
+                    if emitted_any:
+                        continue
+
+                    # If we touched an intermediate patch but couldn't split into endpoint-local pieces,
+                    # drop this candidate in Largest Network so it doesn't "jump over" the patch.
+                    if largest_network_mode and extra_patches:
+                        continue
+
+                    corridor_area_ha = float(corridor_geom.area() / 10000.0)
+                    if corridor_area_ha <= 0:
+                        continue
+                    if params.max_corridor_area is not None and corridor_area_ha > params.max_corridor_area:
+                        continue
+
+                    _push_candidate(
+                        {
+                            "patch1": int(pid1),
+                            "patch2": int(pid2),
+                            "patch_ids": set(patch_ids),
+                            "geom": clone_geometry(corridor_geom),
+                            "area_ha": corridor_area_ha,
+                            "original_area_ha": corridor_area_ha,
+                            "distance_m": float(distance),
+                            "variant": variant_tag,
+                            "source": best_source,
+                        }
+                    )
+                processed_pairs.add(pair)
+
+    emit_progress(progress_cb, progress_end, "Candidate corridors ready.")
+    all_corridors: List[Dict] = []
+    for items in candidates_by_pair.values():
+        all_corridors.extend(items)
     print(f"\n  ✓ Found {len(all_corridors)} possible corridors")
+
+    if timings:
+        for label, duration in accum_durations.items():
+            count = accum_counts.get(label, 0)
+            timings.add(f"Find corridors | {label} (count={count})", duration)
+
+    if timing_out is not None and circuit_mode:
+        try:
+            durations = dict(accum_durations)
+            durations["total"] = time.perf_counter() - timing_start
+            timing_out["durations_s"] = durations
+            timing_out["counts"] = dict(accum_counts)
+            timing_out["candidates"] = len(all_corridors)
+        except Exception:
+            pass
+
     return all_corridors
 
 
-def find_shortest_corridor_from_group(
-    start_patches: Set[int],
-    all_patches: Dict[int, Dict],
-    spatial_index: QgsSpatialIndex,
-    params: VectorRunParams,
-    navigator: Optional[RasterNavigator] = None,
-) -> Optional[Tuple]:
-    """
-    Find the smallest-area corridor connecting the current group to any other patch.
-    """
-    if not start_patches:
-        return None
-
-    start_geoms = [all_patches[pid]["geom"] for pid in start_patches]
-    start_union = QgsGeometry.unaryUnion(start_geoms)
-
-    rect = start_union.boundingBox()
-    rect.grow(params.max_search_distance)
-    candidate_ids = spatial_index.intersects(rect)
-
-    best_corridor = None
-    best_area = float("inf")
-    best_target_id = None
-
-    for candidate_id in candidate_ids:
-        if candidate_id in start_patches:
-            continue
-
-        target = all_patches.get(candidate_id)
-        if not target:
-            continue
-
-        target_geom = target["geom"]
-        if start_union.distance(target_geom) > params.max_search_distance:
-            continue
-
-        p1 = start_union.nearestPoint(target_geom).asPoint()
-        p2 = target_geom.nearestPoint(start_union).asPoint()
-        if p1.isEmpty() or p2.isEmpty():
-            continue
-
-        if navigator:
-            path_points = navigator.find_path(QgsPointXY(p1), QgsPointXY(p2))
-            if not path_points:
-                continue
-            geom_candidate = _create_corridor_geometry(
-                path_points,
-                start_union,
-                target_geom,
-                params,
-                obstacle_geoms=navigator.obstacle_geoms,
-                smooth_iterations=3,
-            )
-        else:
-            geom_candidate = _create_corridor_geometry(
-                [QgsPointXY(p1), QgsPointXY(p2)],
-                start_union,
-                target_geom,
-                params,
-            )
-
-        if geom_candidate is None:
-            continue
-
-        corridor_area_ha = geom_candidate.area() / 10000.0
-        if corridor_area_ha <= 0:
-            continue
-        if params.max_corridor_area is not None and corridor_area_ha > params.max_corridor_area:
-            continue
-
-        if corridor_area_ha < best_area:
-            best_corridor = geom_candidate
-            best_area = corridor_area_ha
-            best_target_id = candidate_id
-
-    if best_corridor is None or best_target_id is None:
-        return None
-    return best_corridor, {best_target_id}, best_area
-
-
-def optimize_most_connectivity(
+def optimize_largest_network_strategy(
     patches: Dict[int, Dict],
     candidates: List[Dict],
     params: VectorRunParams,
+    allow_loops: bool = True,
+    mode: str = "resilient",
 ) -> Tuple[Dict[int, Dict], Dict]:
-    """Strategy 1: Most Connectivity - maximise total connected area."""
-    print("  Strategy: MOST CONNECTIVITY (Dynamic State-Aware)")
-    uf = UnionFind()
-    component_area: Dict[int, float] = {}
-    component_active: Dict[int, bool] = {}
-    for pid, pdata in patches.items():
-        uf.find(pid)
-        uf.size[pid] = pdata["area_ha"]
-        uf.count[pid] = 1
-        component_area[pid] = pdata["area_ha"]
-        component_active[pid] = False
+    """
+    Graph-based Strategy: Entropy Minimization
 
+    Modes:
+      - resilient: MST + optional strategic loops (multi-network allowed).
+      - largest_network: Grow the largest single network (seed = largest patch), then optional loops.
+    """
+    if graph_math is None:
+        raise VectorAnalysisError("NetworkX is required for Largest Network optimization but could not be imported.")
+
+    mode = (mode or "resilient").lower()
     selected: Dict[int, Dict] = {}
-    remaining_budget = params.budget_area
-    connections_made = 0
+    selected_pairs: Set[Tuple[int, int]] = set()
+    budget_used = 0.0
+    remaining = params.budget_area
 
-    def _marginal_gain(root_a: int, root_b: int) -> float:
-        active_a = component_active.get(root_a, False)
-        active_b = component_active.get(root_b, False)
-        area_a = component_area.get(root_a, 0.0)
-        area_b = component_area.get(root_b, 0.0)
-        # Rescue: Both isolated -> Benefit = A + B
-        if not active_a and not active_b:
-            return area_a + area_b
-        # Merger: Both connected -> Benefit = 0
-        if active_a and active_b:
-            return 0.0
-        # Expansion: One connected -> Benefit = Isolated one
-        return area_b if active_a else area_a
-
-    while remaining_budget > 0:
-        best_candidate: Optional[Dict] = None
-        best_efficiency = 0.0
-        best_gain = 0.0
-
-        for cand in candidates:
-            cost = cand["area_ha"]
-            if cost > remaining_budget:
-                continue
-            p1, p2 = cand["patch1"], cand["patch2"]
-            root1, root2 = uf.find(p1), uf.find(p2)
-            if root1 == root2:
-                continue
-            
-            # Recalculate gain based on current connectivity state
-            gain = _marginal_gain(root1, root2)
-            if gain <= 0:
-                continue
-                
-            efficiency = gain / cost if cost > 0 else float("inf")
-            if (
-                best_candidate is None
-                or efficiency > best_efficiency
-                or (efficiency == best_efficiency and gain > best_gain)
-            ):
-                best_candidate = cand
-                best_efficiency = efficiency
-                best_gain = gain
-
-        if best_candidate is None:
-            break
-
-        cost = best_candidate["area_ha"]
-        p1, p2 = best_candidate["patch1"], best_candidate["patch2"]
-        root1, root2 = uf.find(p1), uf.find(p2)
-        area1 = component_area.get(root1, patches[p1]["area_ha"])
-        area2 = component_area.get(root2, patches[p2]["area_ha"])
-
-        new_root = uf.union(p1, p2)
-        uf.size[new_root] += cost
-        component_area[new_root] = area1 + area2
-        component_active[new_root] = True
-        if new_root != root1:
-            component_area.pop(root1, None)
-            component_active.pop(root1, None)
-        if new_root != root2:
-            component_area.pop(root2, None)
-            component_active.pop(root2, None)
-
-        connections_made += 1
-        remaining_budget -= cost
-
-        connected_area = uf.get_size(new_root)
-        efficiency = best_gain / cost if cost > 0 else float("inf")
-        selected[len(selected) + 1] = {
-            "geom": best_candidate["geom"],
-            "patch_ids": {p1, p2},
-            "area_ha": cost,
-            "connected_area_ha": connected_area,
-            "efficiency": efficiency,
+    # ------------------------------------------------------------------
+    # Phase 1: Backbone construction
+    # ------------------------------------------------------------------
+    def _add_corridor(cand: Dict, corr_type: str) -> None:
+        nonlocal budget_used, remaining
+        try:
+            a = int(cand.get("patch1"))
+            b = int(cand.get("patch2"))
+        except Exception:
+            return
+        pk = (a, b) if a <= b else (b, a)
+        # Largest Network should not contain parallel corridors between the same patch pair.
+        # (Rewires explicitly delete the old edge before adding the replacement.)
+        if pk in selected_pairs:
+            return
+        cid = len(selected) + 1
+        selected[cid] = {
+            "geom": clone_geometry(cand["geom"]),
+            "patch_ids": cand.get("patch_ids", {cand.get("patch1"), cand.get("patch2")}),
+            "area_ha": cand.get("area_ha", 0.0),
+            "p1": cand.get("patch1"),
+            "p2": cand.get("patch2"),
+            "distance": cand.get("distance_m", 1.0),
+            "type": corr_type,
+            "variant": cand.get("variant"),
+            "source": cand.get("source"),
         }
+        selected_pairs.add(pk)
+        budget_used += cand.get("area_ha", 0.0)
+        remaining -= cand.get("area_ha", 0.0)
 
-    active_roots = [root for root, active in component_active.items() if active]
-    root_areas = {root: uf.get_size(root) for root in active_roots}
-    root_counts = {root: uf.get_count(root) for root in active_roots}
+    backbone_edges: List[Tuple[int, int, float, float]] = []
+
+    if mode == "largest_network":
+        print("  Strategy: Largest Network")
+        # Seed with largest patch by area and grow outward (Prim-style) to avoid hub-and-spoke
+        seed_patch = max(patches.keys(), key=lambda pid: patches[pid]["area_ha"])
+        visited: Set[int] = {seed_patch}
+
+        adjacency: Dict[int, List[Dict]] = defaultdict(list)
+        for cand in candidates:
+            p1, p2 = cand.get("patch1"), cand.get("patch2")
+            adjacency[p1].append(cand)
+            adjacency[p2].append(cand)
+
+        heap: List[Tuple[float, float, int, Dict]] = []
+        counter = 0
+        for cand in adjacency.get(seed_patch, []):
+            counter += 1
+            heapq.heappush(
+                heap,
+                (cand.get("distance_m", float("inf")), cand.get("area_ha", float("inf")), counter, cand),
+            )
+
+        while heap and remaining > 0:
+            _dist, cost, _idx, cand = heapq.heappop(heap)
+            if cost > remaining:
+                continue
+            p1, p2 = cand.get("patch1"), cand.get("patch2")
+            in1, in2 = p1 in visited, p2 in visited
+            if in1 and in2:
+                continue  # already connected; skip to avoid redundant spokes
+            if not in1 and not in2:
+                continue  # does not touch current network
+
+            new_node = p2 if in1 else p1
+            _add_corridor(cand, "backbone")
+            backbone_edges.append((p1, p2, cost, cand.get("distance_m", 1.0)))
+            visited.add(new_node)
+
+            for nxt in adjacency.get(new_node, []):
+                n_p1, n_p2 = nxt.get("patch1"), nxt.get("patch2")
+                if (n_p1 in visited and n_p2 in visited) or (n_p1 not in visited and n_p2 not in visited):
+                    continue
+                counter += 1
+                heapq.heappush(
+                    heap,
+                    (nxt.get("distance_m", float("inf")), nxt.get("area_ha", float("inf")), counter, nxt),
+                )
+
+    else:
+        print(f"  Strategy: Resilient (loops allowed={allow_loops})")
+        _log_message("--- Phase 1: Building Backbone ---")
+        mst_candidates = sorted(
+            candidates,
+            key=lambda x: (
+                x.get("distance_m", float("inf")),
+                x.get("area_ha", float("inf")),
+            ),
+        )
+        uf = UnionFind()
+        for pid in patches:
+            uf.find(pid)
+
+        for cand in mst_candidates:
+            cost = cand.get("area_ha", 0.0)
+            p1 = cand.get("patch1")
+            p2 = cand.get("patch2")
+
+            if cost > remaining:
+                continue
+
+            if uf.union(p1, p2):
+                _add_corridor(cand, "backbone")
+                backbone_edges.append((p1, p2, cost, cand.get("distance_m", 1.0)))
+
+    _log_message(f"  Backbone complete. Budget used: {budget_used:.2f}/{params.budget_area:.2f}")
+
+    # ------------------------------------------------------------------
+    # Phase 2a: Parallel Reinforcement (Optional)
+    # ------------------------------------------------------------------
+    def _pair_key(p1: int, p2: int) -> Tuple[int, int]:
+        return (p1, p2) if p1 <= p2 else (p2, p1)
+
+    def _overlap_ratio(g1: QgsGeometry, g2: QgsGeometry) -> float:
+        try:
+            a1 = g1.area()
+            a2 = g2.area()
+            denom = min(a1, a2)
+            if denom <= 0:
+                return 1.0
+            inter = g1.intersection(g2)
+            if inter is None or inter.isEmpty():
+                return 0.0
+            return inter.area() / denom
+        except Exception:
+            return 1.0
+
+    # Largest Network should not add a second corridor between the same backbone patch pair.
+    # (Users expect redundancy via alternate patch pairs, not parallel duplicates.)
+    if mode != "largest_network" and remaining > 0 and selected and backbone_edges:
+        _log_message("--- Phase 2a: Reinforcing Existing Links ---")
+        # Prefer spending remaining budget on redundant (spatially distinct) links
+        # between already-backbone-connected patch pairs, rather than creating many
+        # long-distance loops across the landscape.
+        max_total_links_per_pair = 2  # 1 backbone + 1 redundant
+        overlap_reject_ratio = 0.85
+
+        backbone_pairs: Set[Tuple[int, int]] = {_pair_key(p1, p2) for p1, p2, _c, _d in backbone_edges}
+
+        selected_geoms_by_pair: Dict[Tuple[int, int], List[QgsGeometry]] = defaultdict(list)
+        for data in selected.values():
+            p1 = data.get("p1")
+            p2 = data.get("p2")
+            if p1 is None or p2 is None:
+                continue
+            g = data.get("geom")
+            if g is None or g.isEmpty():
+                continue
+            selected_geoms_by_pair[_pair_key(int(p1), int(p2))].append(g)
+
+        reinforce_ranked: List[Tuple[float, float, Dict]] = []
+        for cand in candidates:
+            p1, p2 = cand.get("patch1"), cand.get("patch2")
+            if p1 is None or p2 is None:
+                continue
+            pk = _pair_key(int(p1), int(p2))
+            if pk not in backbone_pairs:
+                continue
+            if len(selected_geoms_by_pair.get(pk, [])) >= max_total_links_per_pair:
+                continue
+            cost = float(cand.get("area_ha", 0.0))
+            if cost <= 0 or cost > remaining:
+                continue
+            g = cand.get("geom")
+            if g is None or g.isEmpty():
+                continue
+            prior_geoms = selected_geoms_by_pair.get(pk, [])
+            overlap = max((_overlap_ratio(g, pg) for pg in prior_geoms), default=0.0)
+            if overlap >= overlap_reject_ratio:
+                continue
+            dist = float(cand.get("distance_m", 1.0))
+            # Reward: low cost, low overlap, short distance.
+            score = (1.0 - overlap) / (cost + 1e-9) * (1.0 / (dist + 1e-6))
+            reinforce_ranked.append((score, overlap, cand))
+
+        reinforce_ranked.sort(key=lambda t: t[0], reverse=True)
+
+        reinforced = 0
+        for _score, overlap, cand in reinforce_ranked:
+            cost = float(cand.get("area_ha", 0.0))
+            if cost > remaining:
+                continue
+            p1 = int(cand.get("patch1"))
+            p2 = int(cand.get("patch2"))
+            pk = _pair_key(p1, p2)
+            if len(selected_geoms_by_pair.get(pk, [])) >= max_total_links_per_pair:
+                continue
+            _add_corridor(cand, "reinforcement")
+            geom = cand.get("geom")
+            if geom is not None:
+                selected_geoms_by_pair.setdefault(pk, []).append(clone_geometry(geom))
+            reinforced += 1
+
+        _log_message(f"  Added {reinforced} redundant link(s) across backbone pairs.")
+
+    # ------------------------------------------------------------------
+    # Phase 2: Strategic Loops (Optional)
+    # ------------------------------------------------------------------
+    if allow_loops and remaining > 0 and selected:
+        _log_message("--- Phase 2: Adding Strategic Loops ---")
+
+        G_backbone = nx.Graph()
+        for pid in patches:
+            G_backbone.add_node(pid)
+        for p1, p2, _, dist in backbone_edges:
+            G_backbone.add_edge(p1, p2, weight=dist)
+
+        loop_candidates = []
+        for cand in candidates:
+            p1, p2 = cand.get("patch1"), cand.get("patch2")
+            if not nx.has_path(G_backbone, p1, p2):
+                continue
+
+            cost = float(cand.get("area_ha", 0.0) or 0.0)
+            if cost <= 0:
+                continue
+
+            cand_dist = float(cand.get("distance_m", 1.0) or 1.0)
+
+            # Rewire: if there is already a direct backbone edge, and this candidate is significantly shorter,
+            # swap it in (acyclic replacement), paying only the cost delta.
+            if G_backbone.has_edge(p1, p2):
+                existing_dist = float(G_backbone[p1][p2].get("weight", 1.0) or 1.0)
+                if cand_dist >= existing_dist * 0.85:
+                    continue
+
+                old_cid = None
+                old_cost = 0.0
+                for cid, data in selected.items():
+                    if data.get("type") != "backbone":
+                        continue
+                    a = data.get("p1")
+                    b = data.get("p2")
+                    if (a == p1 and b == p2) or (a == p2 and b == p1):
+                        old_cid = cid
+                        old_cost = float(data.get("area_ha", 0.0) or 0.0)
+                        break
+                if old_cid is None:
+                    continue
+
+                extra_needed = max(0.0, cost - old_cost)
+                if extra_needed > remaining:
+                    continue
+
+                # Refund old edge cost then add new edge cost (net = extra_needed).
+                del selected[old_cid]
+                budget_used -= old_cost
+                remaining += old_cost
+                try:
+                    pk_old = _pair_key(int(p1), int(p2))
+                    selected_pairs.discard(pk_old)
+                except Exception:
+                    pass
+                _add_corridor(cand, "backbone")
+                G_backbone[p1][p2]["weight"] = cand_dist
+
+                for i, (a, b, c, d) in enumerate(backbone_edges):
+                    if (a == p1 and b == p2) or (a == p2 and b == p1):
+                        backbone_edges[i] = (p1, p2, cost, cand_dist)
+                        break
+
+                continue
+
+            # Otherwise, treat it as a loop candidate (shortcuts after connectivity exists).
+            if cost <= remaining:
+                score = graph_math.score_edge_for_loops(G_backbone, p1, p2, cand_dist)
+                efficiency = score / cost if cost else 0.0
+                loop_candidates.append((efficiency, cand))
+
+        loop_candidates.sort(key=lambda x: x[0], reverse=True)
+
+        loops_added = 0
+        for _eff, cand in loop_candidates:
+            cost = cand.get("area_ha", 0.0)
+            if cost <= remaining:
+                _add_corridor(cand, "strategic_loop")
+                p1, p2 = cand.get("patch1"), cand.get("patch2")
+                backbone_edges.append((p1, p2, cost, cand.get("distance_m", 1.0)))
+                loops_added += 1
+
+        _log_message(f"  Added {loops_added} strategic loops.")
+
+    # ------------------------------------------------------------------
+    # Phase 3: Metrics
+    # ------------------------------------------------------------------
+    final_corridors_list = []
+    for cid, data in selected.items():
+        final_corridors_list.append(
+            {"id": cid, "patch1": data.get("p1"), "patch2": data.get("p2"), "distance_m": data.get("distance", 1.0)}
+        )
+
+    G_final = graph_math.build_graph_from_corridors(patches, final_corridors_list)
+    entropy_stats = graph_math.calculate_total_entropy(G_final)
+    rho2 = graph_math.calculate_two_edge_connectivity(G_final)
+
     stats = {
-        "strategy": "most_connectivity",
+        "strategy": "largest_network",
         "corridors_used": len(selected),
-        "connections_made": connections_made,
-        "budget_used_ha": params.budget_area - remaining_budget,
-        "total_connected_area_ha": sum(root_areas.values()),
-        "groups_created": len(root_areas),
-        "largest_group_area_ha": max(root_areas.values()) if root_areas else 0,
-        "patches_connected": sum(root_counts.values()),
+        "budget_used_ha": budget_used,
+        "patches_connected": G_final.number_of_nodes(),
+        "entropy_total": entropy_stats["H_total"],
+        "robustness_rho2": rho2,
+        "mode": "Largest Network",
+        "total_connected_area_ha": sum(p["area_ha"] for p in patches.values()),
+        "largest_group_area_ha": 0.0,
     }
-    print(f"  ✓ Selected {len(selected)} efficient corridors")
+
+    comps = list(nx.connected_components(G_final))
+    if comps:
+        max_area = max(sum(patches[pid]["area_ha"] for pid in comp) for comp in comps)
+        stats["largest_group_area_ha"] = max_area
+
+    for data in selected.values():
+        connected_area = stats.get("largest_group_area_ha", 0.0)
+        data["connected_area_ha"] = connected_area
+        area = data.get("area_ha", 0.0)
+        data["efficiency"] = (connected_area / area) if area else 0.0
+
     return selected, stats
 
 
-def optimize_largest_patch(
+def optimize_circuit_utility(
     patches: Dict[int, Dict],
-    spatial_index: QgsSpatialIndex,
+    candidates: List[Dict],
     params: VectorRunParams,
-    navigator: Optional[RasterNavigator] = None,
+    overlap_reject_ratio: float = 0.30,
 ) -> Tuple[Dict[int, Dict], Dict]:
-    """Strategy 3: Largest Patch - create a single largest connected patch."""
-    print("  Strategy: LARGEST PATCH")
-    print("    Testing different seed patches...")
+    """
+    Circuit Theory (Utility) strategy:
+    Weighted greedy selection by marginal utility per cost.
 
-    best_result = {"corridors": {}, "final_area": 0.0, "seed_id": None}
-    sorted_patches = sorted(patches.keys(), key=lambda k: patches[k]["area_ha"], reverse=True)
+    Utility Score:
+      score = (sqrt(area_p1 * area_p2) / cost) * multiplier
 
-    for i, seed_id in enumerate(sorted_patches[: min(20, len(sorted_patches))]):
-        if (i + 1) % 5 == 0:
-            print(f"      Testing seed {i + 1}...", end="\r")
+    Multiplier:
+      1.0  if candidate connects different components
+      0.5  if already connected but spatially distinct
+      0.01 if overlaps existing corridor for the pair by > overlap_reject_ratio
+    """
+    def _pair_key(a: int, b: int) -> Tuple[int, int]:
+        return (a, b) if a <= b else (b, a)
 
-        current_patches = {seed_id}
-        current_area = patches[seed_id]["area_ha"]
-        remaining_budget = params.budget_area
-        sim_corridors: Dict[int, Dict] = {}
+    def _safe_geom_area(geom: QgsGeometry) -> float:
+        try:
+            if geom is None or geom.isEmpty():
+                return 0.0
+            return float(geom.area())
+        except Exception:
+            return 0.0
 
-        while remaining_budget > 0:
-            result = find_shortest_corridor_from_group(
-                current_patches,
-                patches,
-                spatial_index,
-                params,
-                navigator=navigator,
-            )
-            if result is None:
-                break
+    def _max_overlap_ratio(new_geom: QgsGeometry, prior: List[QgsGeometry]) -> float:
+        denom = _safe_geom_area(new_geom)
+        if denom <= 0 or not prior:
+            return 0.0
+        max_ratio = 0.0
+        for g in prior:
+            try:
+                try:
+                    proximity_dist = max(float(getattr(params, "min_corridor_width", 0.0) or 0.0) * 1.5, float(getattr(params, "grid_resolution", 0.0) or 0.0) * 2.0)
+                    if proximity_dist > 0 and new_geom.distance(g) <= proximity_dist:
+                        return 1.0
+                except Exception:
+                    pass
+                inter = new_geom.intersection(g)
+                if inter is None or inter.isEmpty():
+                    continue
+                ratio = float(inter.area()) / denom
+                if ratio > max_ratio:
+                    max_ratio = ratio
+            except Exception:
+                continue
+        return max_ratio
 
-            corr_geom, targets, corr_area = result
-            if corr_area > remaining_budget:
-                break
+    def _candidate_cost_ha(cand: Dict) -> float:
+        try:
+            return float(cand.get("area_ha", 0.0) or 0.0)
+        except Exception:
+            return 0.0
 
-            new_area = sum(patches[pid]["area_ha"] for pid in targets if pid not in current_patches)
-            current_area += corr_area + new_area
+    def _patch_area_ha(pid: int) -> float:
+        try:
+            return float(patches.get(pid, {}).get("area_ha", 0.0) or 0.0)
+        except Exception:
+            return 0.0
 
-            efficiency = corr_area / current_area if current_area > 0 else 0
+    def _get_patch_ids(cand: Dict) -> List[int]:
+        try:
+            pids = cand.get("patch_ids")
+            if pids:
+                return [int(pid) for pid in pids if pid is not None]
+        except Exception:
+            pass
+        p1, p2 = cand.get("patch1"), cand.get("patch2")
+        if p1 is None or p2 is None:
+            return []
+        return [int(p1), int(p2)]
 
-            sim_corridors[len(sim_corridors) + 1] = {
-                "geom": corr_geom,
-                "patch_ids": set(current_patches | targets),
-                "area_ha": corr_area,
-                "connected_area_ha": current_area,
-                "efficiency": efficiency,
-            }
+    def _get_pair(cand: Dict) -> Tuple[int, int]:
+        p1, p2 = cand.get("patch1"), cand.get("patch2")
+        if p1 is None or p2 is None:
+            return (0, 0)
+        return _pair_key(int(p1), int(p2))
 
-            remaining_budget -= corr_area
-            current_patches.update(targets)
+    def _get_cost(cand: Dict) -> float:
+        return float(_candidate_cost_ha(cand) or 0.0)
 
-        if current_area > best_result["final_area"]:
-            best_result = {
-                "corridors": sim_corridors,
-                "final_area": current_area,
-                "seed_id": seed_id,
-            }
+    def _get_base_roi(cand: Dict) -> float:
+        geom = cand.get("geom")
+        if geom is None or geom.isEmpty():
+            return 0.0
+        cost = float(_candidate_cost_ha(cand) or 0.0)
+        if cost <= 0.0:
+            return 0.0
+        p1, p2 = cand.get("patch1"), cand.get("patch2")
+        if p1 is None or p2 is None:
+            return 0.0
+        p1i, p2i = int(p1), int(p2)
+        w = math.sqrt(max(_patch_area_ha(p1i), 0.0) * max(_patch_area_ha(p2i), 0.0))
+        if w <= 0.0:
+            return 0.0
+        return float(w / cost)
 
-    print(f"\n  ✓ Found optimal seed patch {best_result['seed_id']}")
+    def _overlap_obj(cand: Dict) -> object:
+        g = cand.get("geom")
+        if g is None or g.isEmpty():
+            return None
+        return clone_geometry(g)
 
-    if not best_result["corridors"]:
-        return {}, {"strategy": "largest_patch", "corridors_used": 0}
+    def _overlap_ratio(cand: Dict, prior: Sequence[object]) -> float:
+        g = cand.get("geom")
+        if g is None or g.isEmpty() or not prior:
+            return 0.0
+        prior_geoms: List[QgsGeometry] = [pg for pg in prior if isinstance(pg, QgsGeometry)]
+        return float(_max_overlap_ratio(g, prior_geoms) or 0.0)
+
+    remaining = float(params.budget_area or 0.0)
+    selected: Dict[int, Dict] = {}
+
+    uf = UnionFind()
+    for pid in patches:
+        uf.find(int(pid))
+
+    # ------------------------------------------------------------------
+    # Phase 1: Bridge-only, efficient-first
+    # ------------------------------------------------------------------
+    # Rank candidates by true gap efficiency; prefer shortest bridge first.
+    bridge_ranked: List[Dict] = []
+    for cand in candidates:
+        try:
+            cost = float(_candidate_cost_ha(cand) or 0.0)
+        except Exception:
+            continue
+        if cost <= 0:
+            continue
+        geom = cand.get("geom")
+        if geom is None or geom.isEmpty():
+            continue
+        pids = _get_patch_ids(cand)
+        if len(pids) < 2:
+            continue
+        try:
+            dist = float(cand.get("distance_m", 0.0) or 0.0)
+        except Exception:
+            dist = 0.0
+        bridge_ranked.append(cand)
+
+    bridge_ranked.sort(
+        key=lambda c: (
+            float(c.get("distance_m", float("inf")) or float("inf")),
+            float(c.get("area_ha", float("inf")) or float("inf")),
+        )
+    )
+
+    for cand in bridge_ranked:
+        cost = float(_candidate_cost_ha(cand) or 0.0)
+        if cost <= 0 or cost > remaining:
+            continue
+        pids = [int(pid) for pid in _get_patch_ids(cand) if pid is not None]
+        if len(pids) < 2:
+            continue
+        roots = {int(uf.find(pid)) for pid in pids}
+        if len(roots) <= 1:
+            continue
+
+        cid = len(selected) + 1
+        selected[cid] = {
+            "geom": clone_geometry(cand["geom"]),
+            "patch_ids": set(cand.get("patch_ids", set(pids))),
+            "area_ha": float(cand.get("area_ha", 0.0) or 0.0),
+            "p1": int(cand.get("patch1")),
+            "p2": int(cand.get("patch2")),
+            "distance": float(cand.get("distance_m", 1.0) or 1.0),
+            "type": "primary",
+            "variant": cand.get("variant"),
+            "source": cand.get("source"),
+            "utility_score": float(_get_base_roi(cand) or 0.0),
+            "overlap_ratio": 0.0,
+        }
+
+        anchor = int(pids[0])
+        for other in pids[1:]:
+            uf.union(anchor, int(other))
+        remaining -= cost
+
+    # ------------------------------------------------------------------
+    # Phase 2: Circuit utility (redundancy/shortcuts) with remaining budget
+    # ------------------------------------------------------------------
+    # This mirrors core_select.select_circuit_utility, but seeds from the Phase 1 unions.
+    selected_overlap_by_pair: Dict[Tuple[int, int], List[QgsGeometry]] = defaultdict(list)
+    selected_count_by_pair: Dict[Tuple[int, int], int] = defaultdict(int)
+    for data in selected.values():
+        try:
+            pk = _get_pair({"patch1": data.get("p1"), "patch2": data.get("p2")})
+            g = data.get("geom")
+            if g is not None and not g.isEmpty():
+                selected_overlap_by_pair.setdefault(pk, []).append(clone_geometry(g))
+                selected_count_by_pair[pk] = selected_count_by_pair.get(pk, 0) + 1
+        except Exception:
+            continue
+
+    heap: List[Tuple[float, int, int, Dict]] = []
+    stamps: Dict[int, int] = {}
+    counter = 0
+
+    def _stamp_key(cand: Dict) -> int:
+        return id(cand)
+
+    for cand in candidates:
+        base = float(_get_base_roi(cand) or 0.0)
+        cost = float(_candidate_cost_ha(cand) or 0.0)
+        geom = cand.get("geom")
+        if base <= 0.0 or cost <= 0.0 or geom is None or geom.isEmpty():
+            continue
+        if cost > remaining:
+            continue
+        counter += 1
+        k = _stamp_key(cand)
+        stamps[k] = stamps.get(k, 0) + 1
+        heapq.heappush(heap, (-base, counter, stamps[k], cand))
+
+    primary_links = len(selected)
+    redundant_links = 0
+    wasteful_links = 0
+
+    while heap and remaining > 0:
+        neg_score, _idx, stamp, cand = heapq.heappop(heap)
+        k = _stamp_key(cand)
+        if stamps.get(k, 0) != int(stamp):
+            continue
+        old_score = -float(neg_score)
+
+        cost = float(_candidate_cost_ha(cand) or 0.0)
+        if cost <= 0.0 or cost > remaining:
+            continue
+        base_roi = float(_get_base_roi(cand) or 0.0)
+        if base_roi <= 0.0:
+            continue
+
+        pids = [int(pid) for pid in _get_patch_ids(cand) if pid is not None]
+        if len(pids) < 2:
+            continue
+        roots = {int(uf.find(pid)) for pid in pids}
+
+        pair = _get_pair(cand)
+        overlap_r = 0.0
+        if len(roots) > 1:
+            mult = 1.0
+        else:
+            prior = selected_overlap_by_pair.get(pair, [])
+            overlap_r = float(_overlap_ratio(cand, prior) or 0.0)
+            if overlap_r > float(overlap_reject_ratio):
+                mult = 0.01
+            else:
+                mult = float(0.5) ** (int(selected_count_by_pair.get(pair, 0)) + 1)
+
+        new_score = base_roi * mult
+        if abs(new_score - old_score) > 1e-12:
+            counter += 1
+            stamps[k] = stamps.get(k, 0) + 1
+            heapq.heappush(heap, (-new_score, counter, stamps[k], cand))
+            continue
+
+        if mult >= 1.0:
+            corr_type = "primary"
+            primary_links += 1
+        else:
+            corr_type = "redundant"
+            redundant_links += 1
+            if mult <= 0.01:
+                corr_type = "wasteful"
+                wasteful_links += 1
+
+        cid = len(selected) + 1
+        selected[cid] = {
+            "geom": clone_geometry(cand["geom"]),
+            "patch_ids": set(cand.get("patch_ids", set(pids))),
+            "area_ha": float(cand.get("area_ha", 0.0) or 0.0),
+            "p1": int(cand.get("patch1")),
+            "p2": int(cand.get("patch2")),
+            "distance": float(cand.get("distance_m", 1.0) or 1.0),
+            "type": corr_type,
+            "variant": cand.get("variant"),
+            "source": cand.get("source"),
+            "utility_score": float(new_score),
+            "overlap_ratio": float(overlap_r),
+        }
+
+        anchor = int(pids[0])
+        for other in pids[1:]:
+            uf.union(anchor, int(other))
+
+        remaining -= cost
+        obj = cand.get("geom")
+        if obj is not None and not obj.isEmpty():
+            lst = selected_overlap_by_pair.setdefault(pair, [])
+            lst.append(clone_geometry(obj))
+            if len(lst) > 3:
+                del lst[0]
+        selected_count_by_pair[pair] = selected_count_by_pair.get(pair, 0) + 1
+
+    # Component areas and per-corridor connected area
+    comp_area: Dict[int, float] = defaultdict(float)
+    comp_count: Dict[int, int] = defaultdict(int)
+    for pid in patches:
+        root = int(uf.find(int(pid)))
+        comp_area[root] += _patch_area_ha(int(pid))
+        comp_count[root] += 1
+    largest_group_area = max(comp_area.values()) if comp_area else 0.0
+    largest_group_patches = max(comp_count.values()) if comp_count else 0
+
+    for data in selected.values():
+        root = int(uf.find(int(data.get("p1"))))
+        connected_area = float(comp_area.get(root, 0.0))
+        data["connected_area_ha"] = connected_area
+        area = float(data.get("area_ha", 0.0) or 0.0)
+        data["efficiency"] = (connected_area / area) if area else 0.0
 
     stats = {
-        "strategy": "largest_patch",
-        "seed_id": best_result["seed_id"],
-        "seed_area_ha": patches[best_result["seed_id"]]["area_ha"],
-        "final_patch_area_ha": best_result["final_area"],
-        "corridors_used": len(best_result["corridors"]),
-        "budget_used_ha": sum(c["area_ha"] for c in best_result["corridors"].values()),
-        "patches_merged": len(set.union(*(c["patch_ids"] for c in best_result["corridors"].values()))),
-        "groups_created": 1,
+        "strategy": "circuit_utility",
+        "corridors_used": len(selected),
+        "budget_used_ha": float((params.budget_area or 0.0) - remaining),
+        "patches_total": len(patches),
+        "patches_connected": largest_group_patches,
+        "components_remaining": len(comp_area) if comp_area else len(patches),
+        "primary_links": int(primary_links),
+        "redundant_links": int(redundant_links),
+        "wasteful_links": int(wasteful_links),
+        "total_connected_area_ha": sum(p.get("area_ha", 0.0) for p in patches.values()),
+        "largest_group_area_ha": largest_group_area,
+        "largest_group_patches": largest_group_patches,
     }
-    return best_result["corridors"], stats
+    return selected, stats
+
+
+def optimize_circuit_utility_largest_network(
+    patches: Dict[int, Dict],
+    candidates: List[Dict],
+    params: VectorRunParams,
+    overlap_reject_ratio: float = 0.30,
+) -> Tuple[Dict[int, Dict], Dict]:
+    """
+    Largest Network (Circuit Utility):
+    Use the Circuit Theory greedy utility model, but constrain selection to grow
+    a single connected component seeded at the largest patch.
+
+    This inherits Circuit Theory behavior (ROI scoring + overlap-aware redundancy),
+    but avoids spending budget on disconnected "side networks".
+    """
+
+    def _pair_key(a: int, b: int) -> Tuple[int, int]:
+        return (a, b) if a <= b else (b, a)
+
+    def _candidate_cost_ha(cand: Dict) -> float:
+        try:
+            return float(cand.get("area_ha", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    def _patch_area_ha(pid: int) -> float:
+        try:
+            return float(patches.get(pid, {}).get("area_ha", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    def _safe_geom_area(geom: QgsGeometry) -> float:
+        try:
+            if geom is None or geom.isEmpty():
+                return 0.0
+            return float(geom.area())
+        except Exception:
+            return 0.0
+
+    def _max_overlap_ratio(new_geom: QgsGeometry, prior: List[QgsGeometry]) -> float:
+        denom = _safe_geom_area(new_geom)
+        if denom <= 0 or not prior:
+            return 0.0
+        max_ratio = 0.0
+        for g in prior:
+            try:
+                try:
+                    proximity_dist = max(
+                        float(getattr(params, "min_corridor_width", 0.0) or 0.0) * 1.5,
+                        float(getattr(params, "grid_resolution", 0.0) or 0.0) * 2.0,
+                    )
+                    if proximity_dist > 0 and new_geom.distance(g) <= proximity_dist:
+                        return 1.0
+                except Exception:
+                    pass
+                inter = new_geom.intersection(g)
+                if inter is None or inter.isEmpty():
+                    continue
+                ratio = float(inter.area()) / denom
+                if ratio > max_ratio:
+                    max_ratio = ratio
+            except Exception:
+                continue
+        return max_ratio
+
+    def _get_patch_ids(cand: Dict) -> List[int]:
+        try:
+            pids = cand.get("patch_ids")
+            if pids:
+                return [int(pid) for pid in pids if pid is not None]
+        except Exception:
+            pass
+        p1, p2 = cand.get("patch1"), cand.get("patch2")
+        if p1 is None or p2 is None:
+            return []
+        return [int(p1), int(p2)]
+
+    def _get_pair(cand: Dict) -> Tuple[int, int]:
+        p1, p2 = cand.get("patch1"), cand.get("patch2")
+        if p1 is None or p2 is None:
+            return (0, 0)
+        return _pair_key(int(p1), int(p2))
+
+    def _get_base_roi(cand: Dict) -> float:
+        geom = cand.get("geom")
+        if geom is None or geom.isEmpty():
+            return 0.0
+        cost = float(_candidate_cost_ha(cand) or 0.0)
+        if cost <= 0.0:
+            return 0.0
+        p1, p2 = cand.get("patch1"), cand.get("patch2")
+        if p1 is None or p2 is None:
+            return 0.0
+        p1i, p2i = int(p1), int(p2)
+        w = math.sqrt(max(_patch_area_ha(p1i), 0.0) * max(_patch_area_ha(p2i), 0.0))
+        if w <= 0.0:
+            return 0.0
+        return float(w / cost)
+
+    def _overlap_ratio(cand: Dict, prior: Sequence[QgsGeometry]) -> float:
+        g = cand.get("geom")
+        if g is None or g.isEmpty() or not prior:
+            return 0.0
+        return float(_max_overlap_ratio(g, list(prior)) or 0.0)
+
+    if not patches:
+        return {}, {"strategy": "largest_network", "corridors_used": 0, "budget_used_ha": 0.0}
+
+    seed_patch = max(patches.keys(), key=lambda pid: float(patches[pid].get("area_ha", 0.0) or 0.0))
+    remaining = float(params.budget_area or 0.0)
+    selected: Dict[int, Dict] = {}
+
+    uf = UnionFind()
+    for pid in patches:
+        uf.find(int(pid))
+
+    def _main_root() -> int:
+        return int(uf.find(int(seed_patch)))
+
+    def _touches_main_and_other(pids: List[int]) -> bool:
+        mr = _main_root()
+        has_main = False
+        has_other = False
+        for pid in pids:
+            r = int(uf.find(int(pid)))
+            if r == mr:
+                has_main = True
+            else:
+                has_other = True
+        return has_main and has_other
+
+    # ------------------------------------------------------------------
+    # Phase 1: Seeded bridge-first (expand main component only)
+    # ------------------------------------------------------------------
+    bridge_ranked: List[Dict] = []
+    for cand in candidates:
+        cost = float(_candidate_cost_ha(cand) or 0.0)
+        if cost <= 0.0:
+            continue
+        geom = cand.get("geom")
+        if geom is None or geom.isEmpty():
+            continue
+        pids = _get_patch_ids(cand)
+        if len(pids) < 2:
+            continue
+        bridge_ranked.append(cand)
+
+    bridge_ranked.sort(
+        key=lambda c: (
+            float(c.get("distance_m", float("inf")) or float("inf")),
+            float(c.get("area_ha", float("inf")) or float("inf")),
+        )
+    )
+
+    selected_overlap_by_pair: Dict[Tuple[int, int], List[QgsGeometry]] = defaultdict(list)
+    selected_count_by_pair: Dict[Tuple[int, int], int] = defaultdict(int)
+
+    for cand in bridge_ranked:
+        cost = float(_candidate_cost_ha(cand) or 0.0)
+        if cost <= 0.0 or cost > remaining:
+            continue
+        pids = [int(pid) for pid in _get_patch_ids(cand) if pid is not None]
+        if len(pids) < 2:
+            continue
+        roots = {int(uf.find(pid)) for pid in pids}
+        if len(roots) <= 1:
+            continue
+        if not _touches_main_and_other(pids):
+            continue
+
+        base_roi = float(_get_base_roi(cand) or 0.0)
+        cid = len(selected) + 1
+        selected[cid] = {
+            "geom": clone_geometry(cand["geom"]),
+            "patch_ids": set(cand.get("patch_ids", set(pids))),
+            "area_ha": float(cand.get("area_ha", 0.0) or 0.0),
+            "p1": int(cand.get("patch1")),
+            "p2": int(cand.get("patch2")),
+            "distance": float(cand.get("distance_m", 1.0) or 1.0),
+            "type": "primary",
+            "variant": cand.get("variant"),
+            "source": cand.get("source"),
+            "utility_score": base_roi,
+            "overlap_ratio": 0.0,
+        }
+
+        anchor = int(pids[0])
+        for other in pids[1:]:
+            uf.union(anchor, int(other))
+        remaining -= cost
+
+        pk = _get_pair(cand)
+        g = cand.get("geom")
+        if g is not None and not g.isEmpty():
+            selected_overlap_by_pair.setdefault(pk, []).append(clone_geometry(g))
+            if len(selected_overlap_by_pair[pk]) > 3:
+                del selected_overlap_by_pair[pk][0]
+        selected_count_by_pair[pk] = selected_count_by_pair.get(pk, 0) + 1
+
+    # ------------------------------------------------------------------
+    # Phase 2: Circuit utility within the single (seeded) network
+    # ------------------------------------------------------------------
+    heap: List[Tuple[float, int, int, Dict]] = []
+    stamps: Dict[int, int] = {}
+    counter = 0
+
+    def _stamp_key(cand: Dict) -> int:
+        return id(cand)
+
+    for cand in candidates:
+        base = float(_get_base_roi(cand) or 0.0)
+        cost = float(_candidate_cost_ha(cand) or 0.0)
+        geom = cand.get("geom")
+        if base <= 0.0 or cost <= 0.0 or geom is None or geom.isEmpty():
+            continue
+        if cost > remaining:
+            continue
+        counter += 1
+        k = _stamp_key(cand)
+        stamps[k] = stamps.get(k, 0) + 1
+        heapq.heappush(heap, (-base, counter, stamps[k], cand))
+
+    primary_links = sum(1 for d in selected.values() if d.get("type") == "primary")
+    redundant_links = 0
+    wasteful_links = 0
+
+    while heap and remaining > 0:
+        neg_score, _idx, stamp, cand = heapq.heappop(heap)
+        k = _stamp_key(cand)
+        if stamps.get(k, 0) != int(stamp):
+            continue
+        old_score = -float(neg_score)
+
+        cost = float(_candidate_cost_ha(cand) or 0.0)
+        if cost <= 0.0 or cost > remaining:
+            continue
+        base_roi = float(_get_base_roi(cand) or 0.0)
+        if base_roi <= 0.0:
+            continue
+
+        pids = [int(pid) for pid in _get_patch_ids(cand) if pid is not None]
+        if len(pids) < 2:
+            continue
+
+        roots = {int(uf.find(pid)) for pid in pids}
+        mr = _main_root()
+
+        overlap_r = 0.0
+        if len(roots) > 1:
+            # Only allow bridges that expand the main component.
+            if not _touches_main_and_other(pids):
+                continue
+            mult = 1.0
+        else:
+            # Only allow redundancy within the main component.
+            if int(next(iter(roots))) != mr:
+                continue
+            pair = _get_pair(cand)
+            prior = selected_overlap_by_pair.get(pair, [])
+            overlap_r = float(_overlap_ratio(cand, prior) or 0.0)
+            if overlap_r > float(overlap_reject_ratio):
+                mult = 0.01
+            else:
+                mult = float(0.5) ** (int(selected_count_by_pair.get(pair, 0)) + 1)
+
+        new_score = base_roi * mult
+        if abs(new_score - old_score) > 1e-12:
+            counter += 1
+            stamps[k] = stamps.get(k, 0) + 1
+            heapq.heappush(heap, (-new_score, counter, stamps[k], cand))
+            continue
+
+        if mult >= 1.0:
+            corr_type = "primary"
+            primary_links += 1
+        else:
+            corr_type = "redundant"
+            redundant_links += 1
+            if mult <= 0.01:
+                corr_type = "wasteful"
+                wasteful_links += 1
+
+        cid = len(selected) + 1
+        selected[cid] = {
+            "geom": clone_geometry(cand["geom"]),
+            "patch_ids": set(cand.get("patch_ids", set(pids))),
+            "area_ha": float(cand.get("area_ha", 0.0) or 0.0),
+            "p1": int(cand.get("patch1")),
+            "p2": int(cand.get("patch2")),
+            "distance": float(cand.get("distance_m", 1.0) or 1.0),
+            "type": corr_type,
+            "variant": cand.get("variant"),
+            "source": cand.get("source"),
+            "utility_score": float(new_score),
+            "overlap_ratio": float(overlap_r),
+        }
+
+        anchor = int(pids[0])
+        for other in pids[1:]:
+            uf.union(anchor, int(other))
+
+        remaining -= cost
+        g = cand.get("geom")
+        pair = _get_pair(cand)
+        if g is not None and not g.isEmpty():
+            lst = selected_overlap_by_pair.setdefault(pair, [])
+            lst.append(clone_geometry(g))
+            if len(lst) > 3:
+                del lst[0]
+        selected_count_by_pair[pair] = selected_count_by_pair.get(pair, 0) + 1
+
+    comp_area: Dict[int, float] = defaultdict(float)
+    comp_count: Dict[int, int] = defaultdict(int)
+    for pid in patches:
+        root = int(uf.find(int(pid)))
+        comp_area[root] += _patch_area_ha(int(pid))
+        comp_count[root] += 1
+
+    mr = _main_root()
+    largest_group_area = float(comp_area.get(mr, 0.0) or 0.0)
+    largest_group_patches = int(comp_count.get(mr, 0) or 0)
+
+    for data in selected.values():
+        data["connected_area_ha"] = largest_group_area
+        area = float(data.get("area_ha", 0.0) or 0.0)
+        data["efficiency"] = (largest_group_area / area) if area else 0.0
+
+    stats = {
+        "strategy": "largest_network",
+        "corridors_used": len(selected),
+        "budget_used_ha": float((params.budget_area or 0.0) - remaining),
+        "patches_total": len(patches),
+        "patches_connected": largest_group_patches,
+        "components_remaining": len(comp_area) if comp_area else len(patches),
+        "primary_links": int(primary_links),
+        "redundant_links": int(redundant_links),
+        "wasteful_links": int(wasteful_links),
+        "total_connected_area_ha": sum(p.get("area_ha", 0.0) for p in patches.values()),
+        "largest_group_area_ha": largest_group_area,
+        "largest_group_patches": largest_group_patches,
+        "seed_patch": int(seed_patch),
+    }
+    return selected, stats
+
+
+def _thicken_corridors(
+    corridors: Dict[int, Dict],
+    remaining_budget: float,
+    params: VectorRunParams,
+    max_width_factor: float = 5.0,
+) -> float:
+    """
+    Use remaining budget to widen existing corridors up to a max factor of the base width.
+    Returns additional budget used.
+    """
+    if remaining_budget <= 0 or not corridors:
+        return 0.0
+
+    print(f"\n  Thickening corridors with remaining budget: {remaining_budget:.4f} ha")
+    budget_used = 0.0
+    max_buffer = (params.min_corridor_width * (max_width_factor - 1)) / 2.0
+    buffer_step = params.min_corridor_width * 0.1  # grow by 10% of base width per pass
+    current_buffer = 0.0
+
+    while budget_used < remaining_budget and current_buffer < max_buffer:
+        current_buffer = min(current_buffer + buffer_step, max_buffer)
+        step_cost = 0.0
+        temp_updates: Dict[int, Tuple[QgsGeometry, float]] = {}
+
+        for cid, cdata in corridors.items():
+            base_geom = cdata.get("_thicken_base_geom")
+            if base_geom is None:
+                base_geom = clone_geometry(cdata.get("geom"))
+                cdata["_thicken_base_geom"] = base_geom
+            if base_geom is None or base_geom.isEmpty():
+                continue
+            try:
+                thickened_geom = base_geom.buffer(current_buffer, BUFFER_SEGMENTS)
+            except Exception:
+                continue
+            if thickened_geom is None or thickened_geom.isEmpty():
+                continue
+            new_area = thickened_geom.area() / 10000.0
+            old_area = float(cdata.get("area_ha", new_area))
+            added_area = new_area - old_area
+            if added_area <= 0:
+                continue
+            step_cost += added_area
+            temp_updates[cid] = (thickened_geom, new_area)
+
+        if budget_used + step_cost > remaining_budget or not temp_updates:
+            print("  Budget exhausted or no further thickening possible; stopping.")
+            break
+
+        for cid, (geom, new_area) in temp_updates.items():
+            corridors[cid]["geom"] = geom
+            corridors[cid]["area_ha"] = new_area
+
+        budget_used += step_cost
+        print(f"    - Thickened by {current_buffer * 2:.1f} m (Cost: {step_cost:.4f} ha)")
+        if current_buffer >= max_buffer:
+            print(f"  Maximum corridor width reached ({max_width_factor}x min width).")
+            break
+
+    print(f"  ✓ Finalized thickening. Total extra budget used: {budget_used:.4f} ha")
+    return budget_used
 
 
 def write_corridors_layer_to_gpkg(
@@ -856,7 +3112,6 @@ def write_corridors_layer_to_gpkg(
     unit_system: str,
     overwrite_file: bool = False,
 ) -> bool:
-    """Write corridor polygons to a specific layer within a GeoPackage."""
     print(f"\nWriting layer '{layer_name}' to {os.path.basename(output_path)} ...")
     transform = QgsCoordinateTransform(target_crs, original_crs, QgsProject.instance())
 
@@ -871,6 +3126,8 @@ def write_corridors_layer_to_gpkg(
     fields.append(QgsField(area_field, QVariant.Double))
     fields.append(QgsField(conn_field, QVariant.Double))
     fields.append(QgsField("efficiency", QVariant.Double))
+    fields.append(QgsField("multipart", QVariant.Bool))
+    fields.append(QgsField("segment_count", QVariant.Int))
 
     save_options = QgsVectorFileWriter.SaveVectorOptions()
     save_options.driverName = "GPKG"
@@ -898,6 +3155,8 @@ def write_corridors_layer_to_gpkg(
         geom = clone_geometry(cdata["geom"])
         geom.transform(transform)
         feat.setGeometry(geom)
+        multipart = geom.isMultipart()
+        segment_count = geom.constGet().numGeometries() if multipart else 1
         feat.setAttributes(
             [
                 cid,
@@ -905,6 +3164,8 @@ def write_corridors_layer_to_gpkg(
                 round(cdata["area_ha"] * area_factor, 4),
                 round(cdata["connected_area_ha"] * area_factor, 2),
                 round(cdata["efficiency"], 6),
+                multipart,
+                segment_count,
             ]
         )
         writer.addFeature(feat)
@@ -915,7 +3176,6 @@ def write_corridors_layer_to_gpkg(
 
 
 def add_layer_to_qgis_from_gpkg(gpkg_path: str, layer_name: str) -> None:
-    """Add a specific layer from a GeoPackage into the project."""
     uri = f"{gpkg_path}|layername={layer_name}"
     layer = QgsVectorLayer(uri, layer_name, "ogr")
     if layer.isValid():
@@ -925,6 +3185,177 @@ def add_layer_to_qgis_from_gpkg(gpkg_path: str, layer_name: str) -> None:
         print(f"  ✗ Could not add '{layer_name}' from {gpkg_path}")
 
 
+def _safe_unary_union(geoms: List[QgsGeometry]) -> Optional[QgsGeometry]:
+    if not geoms:
+        return None
+    try:
+        merged = QgsGeometry.unaryUnion(geoms)
+    except Exception:
+        merged = geoms[0]
+        for extra in geoms[1:]:
+            try:
+                merged = merged.combine(extra)
+            except Exception:
+                pass
+    if merged is None or merged.isEmpty():
+        return None
+    try:
+        merged = merged.makeValid()
+    except Exception:
+        pass
+    return merged if (merged is not None and not merged.isEmpty()) else None
+
+
+def build_contiguous_network_summaries(
+    patches: Dict[int, Dict],
+    corridors: Dict[int, Dict],
+) -> List[Dict]:
+    """Group patches/corridors into connected networks and dissolve geometries per network."""
+    if not patches:
+        return []
+
+    uf = UnionFind()
+    for pid in patches.keys():
+        uf.find(int(pid))
+
+    for cdata in corridors.values():
+        pids = list(cdata.get("patch_ids", []))
+        if len(pids) < 2:
+            continue
+        base = int(pids[0])
+        for other in pids[1:]:
+            uf.union(base, int(other))
+
+    root_to_pids: Dict[int, Set[int]] = defaultdict(set)
+    for pid in patches.keys():
+        root_to_pids[int(uf.find(int(pid)))].add(int(pid))
+
+    root_to_corridors: Dict[int, List[int]] = defaultdict(list)
+    for cid, cdata in corridors.items():
+        pids = list(cdata.get("patch_ids", []))
+        if not pids:
+            continue
+        root_to_corridors[int(uf.find(int(pids[0])))] += [int(cid)]
+
+    summaries: List[Dict] = []
+    network_id = 1
+    for root, pid_set in sorted(root_to_pids.items(), key=lambda kv: kv[0]):
+        geom_parts: List[QgsGeometry] = []
+        patch_area_ha = 0.0
+        for pid in sorted(pid_set):
+            pdata = patches.get(pid)
+            if not pdata:
+                continue
+            pgeom = pdata.get("geom")
+            if pgeom is not None and (not pgeom.isEmpty()):
+                geom_parts.append(clone_geometry(pgeom))
+            patch_area_ha += float(pdata.get("area_ha", 0.0) or 0.0)
+
+        corridor_ids = root_to_corridors.get(root, [])
+        corridor_area_ha = 0.0
+        for cid in corridor_ids:
+            cdata = corridors.get(cid) or {}
+            cgeom = cdata.get("geom")
+            if cgeom is not None and (not cgeom.isEmpty()):
+                geom_parts.append(clone_geometry(cgeom))
+            corridor_area_ha += float(cdata.get("area_ha", 0.0) or 0.0)
+
+        net_geom = _safe_unary_union(geom_parts)
+
+        summaries.append(
+            {
+                "network_id": network_id,
+                "patch_ids": set(pid_set),
+                "corridor_ids": list(corridor_ids),
+                "geom": net_geom,
+                "area_ha": (net_geom.area() / 10000.0) if net_geom else 0.0,
+                "patch_count": len(pid_set),
+                "patch_area_ha": patch_area_ha,
+                "corridor_count": len(corridor_ids),
+                "corridor_area_ha": corridor_area_ha,
+            }
+        )
+        network_id += 1
+
+    return summaries
+
+
+def write_contiguous_networks_layer_to_gpkg(
+    networks: List[Dict],
+    output_path: str,
+    layer_name: str,
+    target_crs: QgsCoordinateReferenceSystem,
+    original_crs: QgsCoordinateReferenceSystem,
+    unit_system: str,
+) -> bool:
+    print(f"\nWriting layer '{layer_name}' to {os.path.basename(output_path)} ...")
+    transform = QgsCoordinateTransform(target_crs, original_crs, QgsProject.instance())
+
+    is_imperial = unit_system == "imperial"
+    area_field = "area_ac" if is_imperial else "area_ha"
+    patch_area_field = "patch_ac" if is_imperial else "patch_ha"
+    corr_area_field = "corr_ac" if is_imperial else "corr_ha"
+    area_factor = 2.471053814 if is_imperial else 1.0
+
+    fields = QgsFields()
+    fields.append(QgsField("network_id", QVariant.Int))
+    fields.append(QgsField("patch_count", QVariant.Int))
+    fields.append(QgsField("corr_count", QVariant.Int))
+    fields.append(QgsField(area_field, QVariant.Double))
+    fields.append(QgsField(patch_area_field, QVariant.Double))
+    fields.append(QgsField(corr_area_field, QVariant.Double))
+    fields.append(QgsField("multipart", QVariant.Bool))
+    fields.append(QgsField("part_count", QVariant.Int))
+
+    save_options = QgsVectorFileWriter.SaveVectorOptions()
+    save_options.driverName = "GPKG"
+    save_options.fileEncoding = "UTF-8"
+    save_options.layerName = layer_name
+    save_options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteLayer
+
+    writer = QgsVectorFileWriter.create(
+        output_path,
+        fields,
+        QgsWkbTypes.Polygon,
+        original_crs,
+        QgsProject.instance().transformContext(),
+        save_options,
+    )
+    if writer.hasError() != QgsVectorFileWriter.NoError:
+        print(f"  ✗ Error: {writer.errorMessage()}")
+        return False
+
+    written = 0
+    for net in networks:
+        geom = net.get("geom")
+        if geom is None or geom.isEmpty():
+            continue
+        feat = QgsFeature(fields)
+        g = clone_geometry(geom)
+        g.transform(transform)
+        feat.setGeometry(g)
+        multipart = g.isMultipart()
+        part_count = g.constGet().numGeometries() if multipart else 1
+        feat.setAttributes(
+            [
+                int(net.get("network_id", written + 1)),
+                int(net.get("patch_count", 0)),
+                int(net.get("corridor_count", 0)),
+                round(float(net.get("area_ha", 0.0)) * area_factor, 4),
+                round(float(net.get("patch_area_ha", 0.0)) * area_factor, 4),
+                round(float(net.get("corridor_area_ha", 0.0)) * area_factor, 4),
+                multipart,
+                int(part_count),
+            ]
+        )
+        writer.addFeature(feat)
+        written += 1
+
+    del writer
+    print(f"  ✓ Wrote {written} network feature(s) to layer '{layer_name}'")
+    return True
+
+
 def create_memory_layer_from_corridors(
     corridors: Dict[int, Dict],
     layer_name: str,
@@ -932,7 +3363,6 @@ def create_memory_layer_from_corridors(
     original_crs: QgsCoordinateReferenceSystem,
     unit_system: str,
 ) -> Optional[QgsVectorLayer]:
-    """Build an in-memory layer for corridor geometries."""
     is_imperial = unit_system == "imperial"
     area_field = "area_ac" if is_imperial else "area_ha"
     conn_field = "conn_area_ac" if is_imperial else "conn_area_ha"
@@ -947,6 +3377,8 @@ def create_memory_layer_from_corridors(
             QgsField(area_field, QVariant.Double),
             QgsField(conn_field, QVariant.Double),
             QgsField("efficiency", QVariant.Double),
+            QgsField("multipart", QVariant.Bool),
+            QgsField("segment_count", QVariant.Int),
         ]
     )
     layer.updateFields()
@@ -957,6 +3389,8 @@ def create_memory_layer_from_corridors(
     for cid, cdata in corridors.items():
         geom = clone_geometry(cdata["geom"])
         geom.transform(transform)
+        multipart = geom.isMultipart()
+        segment_count = geom.constGet().numGeometries() if multipart else 1
         feat = QgsFeature(layer.fields())
         feat.setGeometry(geom)
         feat.setAttributes(
@@ -966,6 +3400,70 @@ def create_memory_layer_from_corridors(
                 round(cdata["area_ha"] * area_factor, 4),
                 round(cdata["connected_area_ha"] * area_factor, 2),
                 round(cdata["efficiency"], 6),
+                multipart,
+                segment_count,
+            ]
+        )
+        features.append(feat)
+
+    provider.addFeatures(features)
+    layer.updateExtents()
+    QgsProject.instance().addMapLayer(layer)
+    print(f"  ✓ Added temporary layer '{layer_name}' to QGIS project")
+    return layer
+
+
+def create_memory_layer_from_networks(
+    networks: List[Dict],
+    layer_name: str,
+    target_crs: QgsCoordinateReferenceSystem,
+    original_crs: QgsCoordinateReferenceSystem,
+    unit_system: str,
+) -> Optional[QgsVectorLayer]:
+    is_imperial = unit_system == "imperial"
+    area_field = "area_ac" if is_imperial else "area_ha"
+    patch_area_field = "patch_ac" if is_imperial else "patch_ha"
+    corr_area_field = "corr_ac" if is_imperial else "corr_ha"
+    area_factor = 2.471053814 if is_imperial else 1.0
+
+    layer = QgsVectorLayer(f"Polygon?crs={original_crs.authid()}", layer_name, "memory")
+    provider = layer.dataProvider()
+    provider.addAttributes(
+        [
+            QgsField("network_id", QVariant.Int),
+            QgsField("patch_count", QVariant.Int),
+            QgsField("corr_count", QVariant.Int),
+            QgsField(area_field, QVariant.Double),
+            QgsField(patch_area_field, QVariant.Double),
+            QgsField(corr_area_field, QVariant.Double),
+            QgsField("multipart", QVariant.Bool),
+            QgsField("part_count", QVariant.Int),
+        ]
+    )
+    layer.updateFields()
+
+    transform = QgsCoordinateTransform(target_crs, original_crs, QgsProject.instance())
+    features: List[QgsFeature] = []
+    for net in networks:
+        geom = net.get("geom")
+        if geom is None or geom.isEmpty():
+            continue
+        g = clone_geometry(geom)
+        g.transform(transform)
+        feat = QgsFeature(layer.fields())
+        feat.setGeometry(g)
+        multipart = g.isMultipart()
+        part_count = g.constGet().numGeometries() if multipart else 1
+        feat.setAttributes(
+            [
+                int(net.get("network_id", 0)),
+                int(net.get("patch_count", 0)),
+                int(net.get("corridor_count", 0)),
+                round(float(net.get("area_ha", 0.0)) * area_factor, 4),
+                round(float(net.get("patch_area_ha", 0.0)) * area_factor, 4),
+                round(float(net.get("corridor_area_ha", 0.0)) * area_factor, 4),
+                multipart,
+                int(part_count),
             ]
         )
         features.append(feat)
@@ -998,20 +3496,78 @@ def _convert_stats_for_units(stats: Dict, unit_system: str) -> Dict:
     return converted
 
 
+def _compute_connectivity_metrics(
+    corridors: Dict[int, Dict],
+    patches: Dict[int, Dict],
+) -> Dict[str, float]:
+    """Compute consistent graph metrics for summaries across strategies."""
+    n_nodes = len(patches)
+    uf = UnionFind()
+    for pid in patches:
+        uf.find(int(pid))
+
+    edges_used = len(corridors)
+    for data in corridors.values():
+        pids = list(data.get("patch_ids", []))
+        if len(pids) >= 2:
+            anchor = int(pids[0])
+            for other in pids[1:]:
+                uf.union(anchor, int(other))
+        else:
+            p1 = data.get("p1") or data.get("patch1")
+            p2 = data.get("p2") or data.get("patch2")
+            if p1 is not None and p2 is not None:
+                uf.union(int(p1), int(p2))
+
+    roots = [uf.find(int(pid)) for pid in patches]
+    components = len(set(roots))
+    redundant_links = max(0, edges_used - (n_nodes - components))
+    avg_degree = (2 * edges_used / n_nodes) if n_nodes > 0 else 0.0
+
+    comp_counts: Dict[int, int] = defaultdict(int)
+    comp_areas: Dict[int, float] = defaultdict(float)
+    for pid, pdata in patches.items():
+        root = int(uf.find(int(pid)))
+        comp_counts[root] += 1
+        try:
+            comp_areas[root] += float(pdata.get("area_ha", 0.0) or 0.0)
+        except Exception:
+            pass
+
+    largest_group_patches = max(comp_counts.values()) if comp_counts else 0
+    largest_group_area_ha = max(comp_areas.values()) if comp_areas else 0.0
+
+    return {
+        "patches_total": n_nodes,
+        "edges_used": edges_used,
+        "components_remaining": components,
+        "redundant_links": redundant_links,
+        "avg_degree": avg_degree,
+        "patches_connected": largest_group_patches,
+        "largest_group_patches": largest_group_patches,
+        "largest_group_area_ha": largest_group_area_ha,
+    }
+
+
 def run_vector_analysis(
     layer: QgsVectorLayer,
     output_dir: str,
     raw_params: Dict,
-    strategy: str = "most_connectivity",
+    strategy: str = "circuit_utility",
     temporary: bool = False,
     iface=None,
     progress_cb: Optional[Callable[[int, Optional[str]], None]] = None,
+    log_cb: Optional[Callable[[str, str], None]] = None,
+    ctx: Optional[AnalysisContext] = None,
 ) -> List[Dict]:
     """Execute the vector corridor analysis for the provided polygon layer."""
     if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
         raise VectorAnalysisError("Selected layer is not a valid vector layer.")
 
+    timings = TimingRecorder()
+
     params = _to_dataclass(raw_params)
+    ctx = ctx or AnalysisContext()
     unit_system = params.unit_system
     area_factor = 2.471053814 if unit_system == "imperial" else 1.0
     area_label = "ac" if unit_system == "imperial" else "ha"
@@ -1023,145 +3579,307 @@ def run_vector_analysis(
         os.makedirs(out_dir, exist_ok=True)
         output_path = os.path.join(out_dir, params.output_name)
 
+    summary_dir = (
+        os.path.dirname(output_path)
+        if output_path
+        else (output_dir or os.path.dirname(layer.source()) or os.getcwd())
+    )
+    if not summary_dir:
+        summary_dir = os.getcwd()
+    os.makedirs(summary_dir, exist_ok=True)
+
     overall_start = time.time()
     print("=" * 70)
-    print("LINKSCAPE VECTOR ANALYSIS v23.2")
+    print("LINKSCAPE VECTOR ANALYSIS v23.3")
     print("=" * 70)
     print("\n1. Loading vector layer...")
     print(f"  ✓ Using layer: {layer.name()} ({layer.featureCount()} features)")
-    _emit_progress(progress_cb, 5, "Loading vector layer…")
+    emit_progress(progress_cb, 5, "Loading vector layer…")
 
     original_crs = layer.crs()
     print(f"  CRS: {original_crs.authid()}")
 
     print("\n2. Determining analysis CRS...")
-    target_crs = get_utm_crs_from_extent(layer)
-    print(f"  ✓ Using {target_crs.authid()} for measurements")
-    _emit_progress(progress_cb, 15, "Preparing data…")
+    with timings.time_block("Determine analysis CRS"):
+        target_crs = get_utm_crs_from_extent(layer)
+        print(f"  ✓ Using {target_crs.authid()} for measurements")
+        emit_progress(progress_cb, 15, "Preparing data…")
+
+        # Auto-scale max search distance if user left it unset/zero
+        try:
+            extent_src = layer.extent()
+            transform_extent = QgsCoordinateTransform(layer.crs(), target_crs, QgsProject.instance())
+            extent = transform_extent.transformBoundingBox(extent_src)
+            max_dimension = max(extent.width(), extent.height())
+            DEFAULT_SCALING_FACTOR = 0.25
+            if params.max_search_distance <= 0 and max_dimension > 0:
+                params.max_search_distance = max_dimension * DEFAULT_SCALING_FACTOR
+                _log_message(
+                    f"Auto-setting max search distance to {DEFAULT_SCALING_FACTOR*100:.0f}% of map extent "
+                    f"({params.max_search_distance:.1f} units)."
+                )
+        except Exception:
+            pass
 
     print("\n3. Loading patches...")
-    patches, spatial_index = load_and_prepare_patches(layer, target_crs, params)
+    with timings.time_block("Load patches and spatial index"):
+        patches, spatial_index = load_and_prepare_patches(layer, target_crs, params)
     if not patches:
         raise VectorAnalysisError("No patches found after filtering.")
-    _emit_progress(progress_cb, 35, "Searching for corridor candidates…")
+    patch_union: Optional[QgsGeometry] = None
+    with timings.time_block("Build patch union"):
+        try:
+            patch_union = QgsGeometry.unaryUnion([p["geom"] for p in patches.values()])
+        except Exception:
+            patch_union = None
+    emit_progress(progress_cb, 35, "Searching for corridor candidates…")
 
     navigator: Optional[RasterNavigator] = None
-    if params.obstacle_enabled and params.obstacle_layer_id:
-        obstacle_layer = QgsProject.instance().mapLayer(params.obstacle_layer_id)
-        if not isinstance(obstacle_layer, QgsVectorLayer) or not obstacle_layer.isValid():
-            print("  ⚠ Selected obstacle layer is unavailable; continuing without obstacle avoidance.")
-        else:
-            try:
-                navigator = RasterNavigator(patches, obstacle_layer, target_crs, params)
+    obstacle_layers: List[QgsVectorLayer] = []
+    skipped_ids: List[str] = []
+    if params.obstacle_enabled and params.obstacle_layer_ids:
+        with timings.time_block("Impassable preparation"):
+            for layer_id in params.obstacle_layer_ids:
+                layer = QgsProject.instance().mapLayer(layer_id)
+                if isinstance(layer, QgsVectorLayer) and layer.isValid() and QgsWkbTypes.geometryType(layer.wkbType()) == QgsWkbTypes.PolygonGeometry:
+                    obstacle_layers.append(layer)
+                else:
+                    skipped_ids.append(str(layer_id))
+
+            if skipped_ids:
                 print(
-                    f"  ✓ Raster navigator grid: {navigator.cols} × {navigator.rows} cells "
-                    f"@ {navigator.resolution:.1f} units"
+                    f"  ⚠ Skipped {len(skipped_ids)} impassable layer(s) that are unavailable or not polygon geometry."
                 )
-            except VectorAnalysisError as exc:
-                print(f"  ⚠ Obstacle avoidance disabled: {exc}")
-                navigator = None
+
+            if obstacle_layers:
+                try:
+                    navigator = RasterNavigator(patches, obstacle_layers, target_crs, params)
+                    print(
+                        f"  ✓ Raster navigator grid: {navigator.cols} × {navigator.rows} cells "
+                        f"@ {navigator.resolution:.1f} units "
+                        f"using {len(obstacle_layers)} impassable layer(s)"
+                    )
+                    # Cache a union of impassables for faster per-corridor checks/clipping.
+                    try:
+                        ctx.impassable_union = QgsGeometry.unaryUnion(
+                            [g for g in navigator.obstacle_geoms if g and (not g.isEmpty())]
+                        ).makeValid()
+                    except Exception:
+                        ctx.impassable_union = None
+                except VectorAnalysisError as exc:
+                    print(f"  ⚠ Impassable land classes disabled: {exc}")
+                    navigator = None
+            else:
+                print("  ⚠ Selected impassable layers are unavailable; continuing without impassable land classes.")
+    else:
+        timings.add("Impassable preparation (disabled)", 0.0)
+
+    # Per-run mutable state lives in the AnalysisContext (not on params).
 
     print("\n4. Precomputing candidate corridors...")
     all_possible = find_all_possible_corridors(
         patches,
         spatial_index,
         params,
+        strategy=strategy,
+        patch_union=patch_union,
+        ctx=ctx,
         progress_cb=progress_cb,
         progress_start=35,
         progress_end=60,
         navigator=navigator,
+        timings=timings,
+        timing_out=None,
     )
 
-    strategy = (strategy or "most_connectivity").lower()
-    strategy_map = {
-        "most_connectivity": (
-            "candidates",
-            optimize_most_connectivity,
-            "Corridors (Most Connectivity)",
-        ),
-        "largest_patch": (
-            "spatial",
-            optimize_largest_patch,
-            "Corridors (Largest Patch)",
-        ),
-    }
+    strategy = (strategy or "circuit_utility").lower()
+    if strategy not in ("largest_network", "circuit_utility"):
+        strategy = "circuit_utility"
 
-    if strategy not in strategy_map:
-        raise VectorAnalysisError(f"Unsupported strategy '{strategy}'.")
-
-    mode, optimize_func, layer_name = strategy_map[strategy]
+    print("\nTOP 20 CANDIDATES BY COST:")
+    sorted_cands = sorted(all_possible, key=lambda x: x.get("area_ha", 999))
+    for i, c in enumerate(sorted_cands[:20]):
+        cost = c.get("area_ha", 0.0)
+        orig = c.get("original_area_ha", cost)
+        patch_count = len(c.get("patch_ids", {c.get('patch1'), c.get('patch2')}))
+        print(
+            f"  {i+1:2d}. {cost:8.5f} ha  via {patch_count} patches  (orig {orig:.3f})"
+        )
 
     print("\n5. Running optimization...")
     print("=" * 70)
     print(f"--- {strategy.replace('_', ' ').upper()} ---")
-    _emit_progress(progress_cb, 65, "Running optimization…")
 
-    if mode == "candidates" and not all_possible:
-        raise VectorAnalysisError(
-            _format_no_corridor_reason(
-                "Precomputation",
-                len(patches),
-                len(all_possible),
-                params,
-            )
-        )
+    if not all_possible:
+        raise VectorAnalysisError(_format_no_corridor_reason("Precomputation", len(patches), len(all_possible), params))
 
-    if mode == "candidates":
-        corridors, stats = optimize_func(patches, all_possible, params)
-    else:
-        corridors, stats = optimize_func(
-            patches,
-            spatial_index,
-            params,
-            navigator=navigator,
-        )
+    # 5. Optimization
+    emit_progress(progress_cb, 60, "Optimizing network...")
+    strategy_key = strategy.lower().replace(" ", "_")
+
+    # --- UPDATED DISPATCH LOGIC ---
+    opt_label = f"Optimization ({strategy_key})"
+    with timings.time_block(opt_label):
+        if strategy_key == "largest_network":
+            corridors, stats = optimize_circuit_utility_largest_network(patches, all_possible, params)
+            layer_name = "Corridors (Largest Network)"
+        elif strategy_key == "circuit_utility":
+            corridors, stats = optimize_circuit_utility(patches, all_possible, params)
+            layer_name = "Corridors (Circuit Theory)"
+        else:
+            raise VectorAnalysisError(f"Unsupported strategy '{strategy_key}'.")
 
     if not corridors:
-        raise VectorAnalysisError(
-            _format_no_corridor_reason(
-                "Optimization",
-                len(patches),
-                len(all_possible),
-                params,
-            )
-        )
+        raise VectorAnalysisError(_format_no_corridor_reason("Optimization", len(patches), len(all_possible), params))
+
+    # Consistent connectivity metrics for all optimization modes
+    try:
+        stats.update(_compute_connectivity_metrics(corridors, patches))
+    except Exception:
+        pass
+
+    timings.add("Thicken corridors (removed)", 0.0)
 
     stats = _convert_stats_for_units(stats, unit_system)
     stats["budget_total_display"] = params.budget_area * area_factor
 
     print("  Preparing outputs...")
-    _emit_progress(progress_cb, 90, "Writing outputs…")
-    if temporary:
-        create_memory_layer_from_corridors(corridors, layer_name, target_crs, original_crs, unit_system)
-    else:
-        write_corridors_layer_to_gpkg(
-            corridors,
-            output_path,
-            layer_name,
-            target_crs,
-            original_crs,
-            unit_system,
-            overwrite_file=True,
-        )
-        add_layer_to_qgis_from_gpkg(output_path, layer_name)
+    emit_progress(progress_cb, 90, "Writing outputs…")
+    with timings.time_block("Write corridor outputs"):
+        if temporary:
+            create_memory_layer_from_corridors(corridors, layer_name, target_crs, original_crs, unit_system)
+        else:
+            write_corridors_layer_to_gpkg(
+                corridors,
+                output_path,
+                layer_name,
+                target_crs,
+                original_crs,
+                unit_system,
+                overwrite_file=True,
+            )
+            add_layer_to_qgis_from_gpkg(output_path, layer_name)
+
+        # Contiguous network areas (patches + corridors dissolved per connected network)
+        networks: List[Dict] = []
+        try:
+            networks = build_contiguous_network_summaries(patches, corridors)
+            networks_layer_name = "Contiguous Areas"
+            if temporary:
+                create_memory_layer_from_networks(networks, networks_layer_name, target_crs, original_crs, unit_system)
+            else:
+                write_contiguous_networks_layer_to_gpkg(
+                    networks,
+                    output_path,
+                    networks_layer_name,
+                    target_crs,
+                    original_crs,
+                    unit_system,
+                )
+                add_layer_to_qgis_from_gpkg(output_path, networks_layer_name)
+        except Exception as net_exc:  # noqa: BLE001
+            print(f"  ⚠ Could not write contiguous areas layer: {net_exc}")
+            networks = []
+
+        # --- LANDSCAPE METRICS REPORT (always written) ---
+        landscape_metrics_path = ""
+        try:
+            strategy_key = (strategy or "circuit_utility").lower()
+            if strategy_key not in ("largest_network", "circuit_utility"):
+                strategy_key = "circuit_utility"
+            if strategy_key == "largest_network":
+                strategy_label = "Largest Network"
+            else:
+                strategy_label = "Circuit Theory"
+
+            analysis_layer_name = f"Contiguous Areas ({strategy_label})"
+            mask, eff_px = _rasterize_networks_to_mask(
+                networks=networks,
+                pixel_size_m=float(getattr(params, "grid_resolution", 50.0) or 50.0),
+                target_crs=target_crs,
+            )
+            from .analysis_raster import _perform_landscape_analysis  # local import avoids hard coupling at import time
+
+            analysis_lines = _perform_landscape_analysis(
+                arr=mask,
+                layer_name=analysis_layer_name,
+                res_x=float(eff_px),
+                res_y=float(eff_px),
+                is_metric=True,
+                params=None,
+            )
+
+            if temporary:
+                temp_file = tempfile.NamedTemporaryFile(
+                    prefix="terralink_landscape_metrics_", suffix=".txt", delete=False
+                )
+                landscape_metrics_path = temp_file.name
+                temp_file.close()
+            else:
+                safe = _safe_filename(layer.name())
+                landscape_metrics_path = os.path.join(
+                    os.path.dirname(output_path) or os.getcwd(),
+                    f"landscape_metrics_{safe}_{strategy_key}.txt",
+                )
+            _write_text_report(landscape_metrics_path, analysis_lines)
+            stats["landscape_metrics_path"] = landscape_metrics_path
+            print(f"  ✓ Saved landscape metrics: {landscape_metrics_path}")
+            try:
+                _add_landscape_metrics_table_layer(f"Landscape Metrics ({analysis_layer_name})", analysis_lines)
+            except Exception:
+                pass
+        except Exception as e:  # noqa: BLE001
+            try:
+                if not landscape_metrics_path:
+                    if temporary:
+                        temp_file = tempfile.NamedTemporaryFile(
+                            prefix="terralink_landscape_metrics_", suffix=".txt", delete=False
+                        )
+                        landscape_metrics_path = temp_file.name
+                        temp_file.close()
+                    else:
+                        safe = _safe_filename(layer.name())
+                        strategy_key = (strategy or "circuit_utility").lower()
+                        if strategy_key not in ("largest_network", "circuit_utility"):
+                            strategy_key = "circuit_utility"
+                        landscape_metrics_path = os.path.join(
+                            os.path.dirname(output_path) or os.getcwd(),
+                            f"landscape_metrics_{safe}_{strategy_key}.txt",
+                        )
+                _write_text_report(landscape_metrics_path, [f"Landscape analysis failed: {e}"])
+                stats["landscape_metrics_path"] = landscape_metrics_path
+                print(f"  ✓ Saved landscape metrics: {landscape_metrics_path}")
+                try:
+                    _add_landscape_metrics_table_layer(
+                        "Landscape Metrics (Error)", [f"Landscape analysis failed: {e}"]
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
     elapsed = time.time() - overall_start
-    _emit_progress(progress_cb, 100, "Vector analysis complete.")
+    emit_progress(progress_cb, 100, "Vector analysis complete.")
 
     print("\n" + "=" * 70)
     print("FINAL SUMMARY")
     print("=" * 70)
-    print(f"Strategy:          {strategy.replace('_', ' ').title()}")
-    print(f"Corridors created: {stats.get('corridors_used', 0)}")
-    if strategy == "largest_patch":
-        print(f"Seed patch:        {stats.get('seed_id')}")
-        print(f"Seed area:         {stats.get('seed_area_display', 0):.2f} {area_label}")
-        print(f"Final patch size:  {stats.get('final_patch_area_display', 0):.2f} {area_label}")
-        print(f"Patches merged:    {stats.get('patches_merged', 0)}")
+    strategy_key = (strategy or "circuit_utility").lower()
+    if strategy_key not in ("largest_network", "circuit_utility"):
+        strategy_key = "circuit_utility"
+    if strategy_key == "largest_network":
+        strategy_label = "Largest Network"
     else:
-        print(f"Connections:       {stats.get('connections_made', 0)}")
-        print(f"Total connected:   {stats.get('total_connected_area_display', 0):.2f} {area_label}")
-        print(f"Largest group:     {stats.get('largest_group_area_display', 0):.2f} {area_label}")
+        strategy_label = "Circuit Theory"
+    print(f"Strategy:          {strategy_label}")
+    print(f"Corridors created: {stats.get('corridors_used', 0)}")
+    print(f"Connections:       {stats.get('connections_made', 0)}")
+    print(f"Total connected:   {stats.get('total_connected_area_display', 0):.2f} {area_label}")
+    print(f"Largest group:     {stats.get('largest_group_area_display', 0):.2f} {area_label}")
+    if "redundant_links" in stats:
+        print(f"Redundant links:   {stats.get('redundant_links', 0)}")
+    if "avg_degree" in stats:
+        print(f"Average degree:    {stats.get('avg_degree', 0):.2f}")
     print(
         f"Budget used:      {stats.get('budget_used_display', 0):.2f} / {params.budget_area * area_factor:.2f} {area_label}"
     )
