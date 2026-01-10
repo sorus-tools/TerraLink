@@ -14,6 +14,11 @@ rsync -a --delete \
   --exclude "__MACOSX" \
   --exclude "__pycache__" \
   --exclude ".DS_Store" \
+  --exclude "TerraLink.zip" \
+  --exclude ".venv" \
+  --exclude "venv" \
+  --exclude ".idea" \
+  --exclude ".vscode" \
   "$ROOT/" "$STAGE/TerraLink/"
 
 find "$STAGE/TerraLink" -name "__pycache__" -type d -prune -exec rm -rf {} +
