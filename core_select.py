@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import Callable, DefaultDict, Dict, Generic, Iterable, List, Optional, Sequence, Tuple, TypeVar
 
 from .linkscape_engine import UnionFind
+try:
+    import networkx as nx
+except Exception:  # pragma: no cover
+    nx = None  # type: ignore
 
 T = TypeVar("T")
 
@@ -26,11 +30,19 @@ def select_circuit_utility(
     get_pair_key: Callable[[T], Tuple[int, int]],
     get_cost: Callable[[T], float],
     get_base_roi: Callable[[T], float],
+    get_length: Callable[[T], float],
+    get_patch_size: Callable[[int], float],
     overlap_ratio: Callable[[T, Sequence[object]], float],
     overlap_obj: Callable[[T], object],
     overlap_reject_ratio: float = 0.30,
     max_prior_per_pair: int = 3,
     diminishing_base: float = 0.5,
+    shortcut_ratio_high: float = 3.0,
+    shortcut_ratio_mid: float = 1.5,
+    shortcut_ratio_low: float = 1.5,
+    shortcut_mult_high: float = 0.9,
+    shortcut_mult_mid: float = 0.5,
+    shortcut_mult_low: float = 0.1,
 ) -> Tuple[List[CircuitPick[T]], Dict[str, object]]:
     """
     Shared Circuit Theory greedy selector used by raster + vector.
@@ -61,9 +73,55 @@ def select_circuit_utility(
 
     # Convert candidates to list once if iterable is one-shot.
     cand_list = list(candidates)
+    all_patch_ids: List[int] = []
+    seen_patch_ids: set[int] = set()
+    for cand in cand_list:
+        for pid in get_patch_ids(cand) or []:
+            try:
+                pid_int = int(pid)
+            except Exception:
+                continue
+            if pid_int in seen_patch_ids:
+                continue
+            seen_patch_ids.add(pid_int)
+            all_patch_ids.append(pid_int)
+
+    for pid in all_patch_ids:
+        uf.find(pid)
+        try:
+            uf.size[pid] = float(get_patch_size(pid) or 0.0)
+            uf.count[pid] = 1
+        except Exception:
+            uf.size[pid] = float(uf.size.get(pid, 0.0) or 0.0)
+
+    G = None
+    if nx is not None:
+        try:
+            G = nx.Graph()
+            G.add_nodes_from(all_patch_ids)
+        except Exception:
+            G = None
 
     def _stamp_key(cand: T) -> int:
         return id(cand)
+
+    def _shortcut_multiplier(p1: int, p2: int, length: float) -> float:
+        if length <= 0:
+            return float(shortcut_mult_low)
+        if G is None:
+            return float(diminishing_base)
+        try:
+            current_len = float(nx.shortest_path_length(G, p1, p2, weight="weight"))
+        except Exception:
+            return float(diminishing_base)
+        ratio = current_len / max(length, 1e-9)
+        if ratio >= float(shortcut_ratio_high):
+            return float(shortcut_mult_high)
+        if ratio >= float(shortcut_ratio_mid):
+            return float(shortcut_mult_mid)
+        if ratio <= float(shortcut_ratio_low):
+            return float(shortcut_mult_low)
+        return float(shortcut_mult_low)
 
     for cand in cand_list:
         base = float(get_base_roi(cand) or 0.0)
@@ -104,14 +162,21 @@ def select_circuit_utility(
         pair = get_pair_key(cand)
         overlap_r = 0.0
         if len(roots) > 1:
-            mult = 1.0
+            root_sizes = [float(uf.size.get(r, 0.0) or 0.0) for r in roots]
+            target_importance = min(root_sizes) if root_sizes else 1.0
+            if target_importance <= 0:
+                target_importance = 1.0
+            mult = float(target_importance)
         else:
             prior = selected_overlap_by_pair.get(pair, [])
             overlap_r = float(overlap_ratio(cand, prior) or 0.0)
             if overlap_r > float(overlap_reject_ratio):
                 mult = 0.01
             else:
-                mult = float(diminishing_base) ** (int(selected_count_by_pair.get(pair, 0)) + 1)
+                length = float(get_length(cand) or 0.0)
+                if length <= 0:
+                    length = cost
+                mult = _shortcut_multiplier(int(pids[0]), int(pids[-1]), float(length))
 
         new_score = base_roi * mult
         if abs(new_score - old_score) > 1e-12:
@@ -120,13 +185,13 @@ def select_circuit_utility(
             heapq.heappush(heap, (-new_score, counter, stamps[k], cand))
             continue
 
-        if mult >= 1.0:
+        if len(roots) > 1:
             corr_type = "primary"
             primary_links += 1
         else:
             corr_type = "redundant"
             redundant_links += 1
-            if mult <= 0.01:
+            if mult <= float(shortcut_mult_low) or mult <= 0.01:
                 corr_type = "wasteful"
                 wasteful_links += 1
 
@@ -152,6 +217,16 @@ def select_circuit_utility(
         except Exception:
             pass
         selected_count_by_pair[pair] += 1
+
+        if G is not None:
+            try:
+                length = float(get_length(cand) or 0.0)
+                if length <= 0:
+                    length = cost
+                for other in pids[1:]:
+                    G.add_edge(anchor, int(other), weight=float(length))
+            except Exception:
+                pass
 
     stats: Dict[str, object] = {
         "budget_used": budget_used,

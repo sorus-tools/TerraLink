@@ -8,7 +8,7 @@
 
 - Set key criteria such as minimum patch size, optimization mode and your budget. 
 
-- Optimization modes: **Largest Network** and **Circuit Theory** (utility/ROI-based selection that can favor high-value redundant links).
+- Optimization modes: **Largest Network** and **Circuit Theory** (utility/ROI-based selection with shortcut efficiency for redundancy).
 
 - Enable **Impassable Land Classes** when there are areas that corridors must avoid (roads, water, cities). Set values for this in raster, or select impassable polygon layers in vector mode.
 
@@ -17,5 +17,6 @@
 - If performance is slow, resample very fine rasters or trim your AOI before running.
 
 - The output data comes embedded with helpful info. Resulting raster cells have the value of the total area that they connect. Vector output has info on the corridors and connected patches in its attribute table. 
+- Raster and vector runs add summary table layers in QGIS, and vector runs also write a summary CSV.
 
 Need more help? Visit the README in this plugin folder for a deeper walkthrough.

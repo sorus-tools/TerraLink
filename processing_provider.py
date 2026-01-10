@@ -5,7 +5,7 @@ from qgis.core import QgsProcessingAlgorithm, QgsProcessingProvider
 class TerraLinkLaunchAlgorithm(QgsProcessingAlgorithm):
     """Processing entry that opens the TerraLink dialog."""
 
-    ALG_ID = "terralink_v1_1_corridor_generation"
+    ALG_ID = "terralink_v1_2_corridor_generation"
 
     def __init__(self, plugin):
         super().__init__()
@@ -54,10 +54,10 @@ class TerraLinkProcessingProvider(QgsProcessingProvider):
         self._plugin = plugin
 
     def id(self) -> str:
-        return "terralink_v1_1"
+        return "terralink_v1_2"
 
     def name(self) -> str:
-        return self.tr("TerraLink (v1.1)")
+        return self.tr("TerraLink")
 
     def tr(self, string: str) -> str:
         return QCoreApplication.translate("TerraLinkProcessingProvider", string)

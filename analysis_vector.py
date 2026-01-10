@@ -18,6 +18,7 @@ import math
 import os
 import tempfile
 import time
+import csv
 from contextlib import contextmanager, nullcontext
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -30,13 +31,14 @@ if not hasattr(np, "int"):  # pragma: no cover
 
 import networkx as nx  # Required for graph-based optimization/metrics
 from .linkscape_engine import NetworkOptimizer, UnionFind
+from .core_select import select_circuit_utility
 from .utils import emit_progress, log_error
 # Import the graph-metrics helper library
 try:
     from . import graph_math
 except ImportError:
     graph_math = None
-from PyQt5.QtCore import QVariant
+from PyQt5.QtCore import QVariant, QUrl
 import random
 from qgis.core import (
     Qgis,
@@ -57,6 +59,15 @@ from qgis.core import (
 )
 
 BUFFER_SEGMENTS = 16
+ROI_REDUNDANCY_BIAS = 0.2  # prefer new connections unless redundancy ROI is clearly higher
+HYBRID_MAX_LINKS_PER_PAIR = 2
+HYBRID_OVERLAP_REJECT_RATIO = 0.85
+SHORTCUT_RATIO_HIGH = 3.0
+SHORTCUT_RATIO_MID = 1.5
+SHORTCUT_RATIO_LOW = 1.5
+SHORTCUT_MULT_HIGH = 0.9
+SHORTCUT_MULT_MID = 0.5
+SHORTCUT_MULT_LOW = 0.1
 
 try:
     from osgeo import gdal, ogr, osr  # type: ignore
@@ -84,6 +95,38 @@ def _write_text_report(path: str, lines: List[str]) -> None:
         fh.write("\n".join(lines).rstrip() + "\n")
 
 
+def _write_summary_csv(path: str, rows: List[Tuple[str, str]]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path) or os.getcwd(), exist_ok=True)
+    except Exception:
+        pass
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["item", "value"])
+        writer.writerows(rows)
+
+
+def _format_number(value: object, decimals: int = 2) -> str:
+    try:
+        return f"{float(value):.{decimals}f}"
+    except Exception:
+        return "" if value is None else str(value)
+
+
+def _add_summary_csv_layer(csv_path: str, layer_title: str) -> None:
+    if QgsVectorLayer is None or QgsProject is None:
+        return
+    try:
+        url = QUrl.fromLocalFile(csv_path).toString()
+        uri = f"{url}?type=csv&delimiter=,&xField=&yField=&geomType=none"
+        layer = QgsVectorLayer(uri, layer_title, "delimitedtext")
+        if not layer.isValid():
+            return
+        QgsProject.instance().addMapLayer(layer)
+    except Exception:
+        return
+
+
 def _safe_filename(name: str, max_len: int = 64) -> str:
     safe = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in (name or ""))
     safe = safe.strip("_") or "layer"
@@ -95,7 +138,7 @@ def _add_landscape_metrics_table_layer(layer_title: str, analysis_lines: List[st
     Add a non-spatial table layer to the QGIS project with the landscape metrics.
     """
     try:
-        rows: List[Tuple[str, str, str]] = []
+        rows: List[Tuple[str, str, str, str]] = []
         in_table = False
         for line in analysis_lines or []:
             if (not in_table) and ("METRIC NAME" in line) and ("|" in line):
@@ -115,25 +158,28 @@ def _add_landscape_metrics_table_layer(layer_title: str, analysis_lines: List[st
             parts = [p.strip() for p in s.split("|")]
             if len(parts) < 3:
                 continue
-            metric, value, interp = parts[0], parts[1], parts[2]
+            if len(parts) >= 4:
+                metric, pre_val, post_val, interp = parts[0], parts[1], parts[2], parts[3]
+            else:
+                metric, pre_val, post_val, interp = parts[0], parts[1], "", parts[2]
             if metric:
-                rows.append((metric, value, interp))
+                rows.append((metric, pre_val, post_val, interp))
 
         if not rows:
             joined = " ".join([l.strip() for l in (analysis_lines or []) if l.strip()])[:240]
             if not joined:
                 joined = "No landscape metrics available."
-            rows = [("Message", joined, "")]
+            rows = [("Message", joined, "", "")]
 
-        uri = "None?field=metric:string(80)&field=value:string(40)&field=interpretation:string(120)"
+        uri = "None?field=metric:string(80)&field=pre_value:string(40)&field=post_value:string(40)&field=interpretation:string(120)"
         layer = QgsVectorLayer(uri, layer_title, "memory")
         if not layer.isValid():
             return
         provider = layer.dataProvider()
         feats: List[QgsFeature] = []
-        for metric, value, interp in rows:
+        for metric, pre_val, post_val, interp in rows:
             feat = QgsFeature(layer.fields())
-            feat.setAttributes([metric, value, interp])
+            feat.setAttributes([metric, pre_val, post_val, interp])
             feats.append(feat)
         provider.addFeatures(feats)
         layer.updateExtents()
@@ -142,40 +188,82 @@ def _add_landscape_metrics_table_layer(layer_title: str, analysis_lines: List[st
         return
 
 
-def _rasterize_networks_to_mask(
-    networks: List[Dict],
-    pixel_size_m: float,
-    target_crs: QgsCoordinateReferenceSystem,
-    max_cells: int = 10_000_000,
-) -> Tuple[np.ndarray, float]:
-    """
-    Rasterize dissolved network polygons to a binary mask for landscape metrics.
-
-    Returns (mask_array, effective_pixel_size_m).
-    """
-    if gdal is None or ogr is None or osr is None:
-        raise RuntimeError("GDAL/OGR not available for rasterize-based landscape metrics.")
-    if not networks:
-        return np.zeros((1, 1), dtype=np.uint8), float(pixel_size_m)
-
-    pixel_size = max(float(pixel_size_m or 0.0), 1.0)
-
+def _compute_geoms_bounds(
+    geoms: List[QgsGeometry],
+) -> Optional[Tuple[float, float, float, float]]:
     xmin = ymin = float("inf")
     xmax = ymax = float("-inf")
-    geoms: List[QgsGeometry] = []
-    for net in networks:
-        geom = net.get("geom")
+    found = False
+    for geom in geoms:
         if geom is None or geom.isEmpty():
             continue
-        geoms.append(geom)
         bb = geom.boundingBox()
         xmin = min(xmin, bb.xMinimum())
         ymin = min(ymin, bb.yMinimum())
         xmax = max(xmax, bb.xMaximum())
         ymax = max(ymax, bb.yMaximum())
+        found = True
+    if not found or not math.isfinite(xmin) or not math.isfinite(ymin) or not math.isfinite(xmax) or not math.isfinite(ymax):
+        return None
+    return xmin, ymin, xmax, ymax
 
-    if not geoms or not math.isfinite(xmin) or not math.isfinite(ymin) or not math.isfinite(xmax) or not math.isfinite(ymax):
-        return np.zeros((1, 1), dtype=np.uint8), float(pixel_size)
+
+def _geom_overlap_ratio(new_geom: QgsGeometry, prior_geoms: List[QgsGeometry]) -> float:
+    try:
+        if new_geom is None or new_geom.isEmpty() or not prior_geoms:
+            return 0.0
+        denom = float(new_geom.area())
+        if denom <= 0:
+            return 1.0
+        best = 0.0
+        for g in prior_geoms:
+            if g is None or g.isEmpty():
+                continue
+            inter = new_geom.intersection(g)
+            if inter is None or inter.isEmpty():
+                continue
+            ratio = float(inter.area()) / denom
+            if ratio > best:
+                best = ratio
+        return best
+    except Exception:
+        return 1.0
+
+
+def _rasterize_geoms_to_mask(
+    geoms: List[QgsGeometry],
+    pixel_size_m: float,
+    target_crs: QgsCoordinateReferenceSystem,
+    max_cells: int = 10_000_000,
+    bounds: Optional[Tuple[float, float, float, float]] = None,
+) -> Tuple[np.ndarray, float]:
+    """
+    Rasterize polygons to a binary mask for landscape metrics.
+
+    Returns (mask_array, effective_pixel_size_m).
+    """
+    if gdal is None or ogr is None or osr is None:
+        raise RuntimeError("GDAL/OGR not available for rasterize-based landscape metrics.")
+
+    pixel_size = max(float(pixel_size_m or 0.0), 1.0)
+    geoms = [geom for geom in geoms if geom is not None and not geom.isEmpty()]
+
+    if bounds is None:
+        xmin = ymin = float("inf")
+        xmax = ymax = float("-inf")
+        use_geoms: List[QgsGeometry] = []
+        for geom in geoms:
+            use_geoms.append(geom)
+            bb = geom.boundingBox()
+            xmin = min(xmin, bb.xMinimum())
+            ymin = min(ymin, bb.yMinimum())
+            xmax = max(xmax, bb.xMaximum())
+            ymax = max(ymax, bb.yMaximum())
+        geoms = use_geoms
+        if not geoms or not math.isfinite(xmin) or not math.isfinite(ymin) or not math.isfinite(xmax) or not math.isfinite(ymax):
+            return np.zeros((1, 1), dtype=np.uint8), float(pixel_size)
+    else:
+        xmin, ymin, xmax, ymax = bounds
 
     pad = pixel_size * 2.0
     xmin -= pad
@@ -207,30 +295,52 @@ def _rasterize_networks_to_mask(
     except Exception:
         srs = None
 
-    ogr_driver = ogr.GetDriverByName("Memory")
-    vds = ogr_driver.CreateDataSource("networks")
-    layer = vds.CreateLayer("networks", srs=srs, geom_type=ogr.wkbMultiPolygon)
-    layer.CreateField(ogr.FieldDefn("id", ogr.OFTInteger))
-    defn = layer.GetLayerDefn()
-
-    for i, qgs_geom in enumerate(geoms, 1):
-        try:
-            ogr_geom = ogr.CreateGeometryFromWkb(bytes(qgs_geom.asWkb()))
-        except Exception:
-            continue
-        if ogr_geom is None:
-            continue
-        feat = ogr.Feature(defn)
-        feat.SetField("id", int(i))
-        feat.SetGeometry(ogr_geom)
-        layer.CreateFeature(feat)
-        feat = None
-
     ds.GetRasterBand(1).Fill(0)
-    gdal.RasterizeLayer(ds, [1], layer, burn_values=[1])
+    if geoms:
+        ogr_driver = ogr.GetDriverByName("Memory")
+        vds = ogr_driver.CreateDataSource("geoms")
+        layer = vds.CreateLayer("geoms", srs=srs, geom_type=ogr.wkbMultiPolygon)
+        layer.CreateField(ogr.FieldDefn("id", ogr.OFTInteger))
+        defn = layer.GetLayerDefn()
+
+        for i, qgs_geom in enumerate(geoms, 1):
+            try:
+                ogr_geom = ogr.CreateGeometryFromWkb(bytes(qgs_geom.asWkb()))
+            except Exception:
+                continue
+            if ogr_geom is None:
+                continue
+            feat = ogr.Feature(defn)
+            feat.SetField("id", int(i))
+            feat.SetGeometry(ogr_geom)
+            layer.CreateFeature(feat)
+            feat = None
+
+        gdal.RasterizeLayer(ds, [1], layer, burn_values=[1])
+
     arr = ds.GetRasterBand(1).ReadAsArray()
     arr = np.asarray(arr, dtype=np.uint8)
     return arr, float(pixel_size)
+
+
+def _rasterize_networks_to_mask(
+    networks: List[Dict],
+    pixel_size_m: float,
+    target_crs: QgsCoordinateReferenceSystem,
+    max_cells: int = 10_000_000,
+    bounds: Optional[Tuple[float, float, float, float]] = None,
+) -> Tuple[np.ndarray, float]:
+    """
+    Rasterize dissolved network polygons to a binary mask for landscape metrics.
+    """
+    geoms = [net.get("geom") for net in networks if net.get("geom") is not None and not net.get("geom").isEmpty()]
+    return _rasterize_geoms_to_mask(
+        geoms=geoms,
+        pixel_size_m=pixel_size_m,
+        target_crs=target_crs,
+        max_cells=max_cells,
+        bounds=bounds,
+    )
 
 def clone_geometry(geom: QgsGeometry) -> QgsGeometry:
     """
@@ -2056,6 +2166,12 @@ def optimize_largest_network_strategy(
         # (Rewires explicitly delete the old edge before adding the replacement.)
         if pk in selected_pairs:
             return
+        base_roi = float(_get_base_roi(cand) or 0.0)
+        target_sizes = [float(_patch_area_ha(pid) or 0.0) for pid in pids]
+        target_importance = min(target_sizes) if target_sizes else 1.0
+        if target_importance <= 0:
+            target_importance = 1.0
+        base_roi = base_roi * target_importance
         cid = len(selected) + 1
         selected[cid] = {
             "geom": clone_geometry(cand["geom"]),
@@ -2481,50 +2597,50 @@ def optimize_circuit_utility(
     selected: Dict[int, Dict] = {}
 
     uf = UnionFind()
-    for pid in patches:
+    for pid, pdata in patches.items():
         uf.find(int(pid))
+        uf.size[int(pid)] = float(pdata.get("area_ha", 0.0) or 0.0)
+        uf.count[int(pid)] = 1
 
-    # ------------------------------------------------------------------
-    # Phase 1: Bridge-only, efficient-first
-    # ------------------------------------------------------------------
-    # Rank candidates by true gap efficiency; prefer shortest bridge first.
-    bridge_ranked: List[Dict] = []
-    for cand in candidates:
+    def _get_length(cand: Dict) -> float:
         try:
-            cost = float(_candidate_cost_ha(cand) or 0.0)
+            length = float(cand.get("distance_m", 0.0) or 0.0)
         except Exception:
-            continue
-        if cost <= 0:
-            continue
-        geom = cand.get("geom")
-        if geom is None or geom.isEmpty():
-            continue
-        pids = _get_patch_ids(cand)
-        if len(pids) < 2:
-            continue
-        try:
-            dist = float(cand.get("distance_m", 0.0) or 0.0)
-        except Exception:
-            dist = 0.0
-        bridge_ranked.append(cand)
+            length = 0.0
+        if length <= 0.0:
+            length = float(_get_cost(cand) or 0.0)
+        return length
 
-    bridge_ranked.sort(
-        key=lambda c: (
-            float(c.get("distance_m", float("inf")) or float("inf")),
-            float(c.get("area_ha", float("inf")) or float("inf")),
-        )
+    def _get_patch_size(pid: int) -> float:
+        return float(_patch_area_ha(pid) or 0.0)
+
+    picks, base_stats = select_circuit_utility(
+        candidates,
+        budget=remaining,
+        get_patch_ids=_get_patch_ids,
+        get_pair_key=_get_pair,
+        get_cost=_get_cost,
+        get_base_roi=_get_base_roi,
+        get_length=_get_length,
+        get_patch_size=_get_patch_size,
+        overlap_ratio=_overlap_ratio,
+        overlap_obj=_overlap_obj,
+        overlap_reject_ratio=float(overlap_reject_ratio),
+        max_prior_per_pair=3,
+        diminishing_base=0.5,
     )
 
-    for cand in bridge_ranked:
-        cost = float(_candidate_cost_ha(cand) or 0.0)
-        if cost <= 0 or cost > remaining:
-            continue
+    for pick in picks:
+        cand = pick.candidate
         pids = [int(pid) for pid in _get_patch_ids(cand) if pid is not None]
         if len(pids) < 2:
             continue
-        roots = {int(uf.find(pid)) for pid in pids}
-        if len(roots) <= 1:
+        cost = float(_candidate_cost_ha(cand) or 0.0)
+        if cost <= 0.0:
             continue
+        anchor = int(pids[0])
+        for other in pids[1:]:
+            uf.union(anchor, int(other))
 
         cid = len(selected) + 1
         selected[cid] = {
@@ -2534,133 +2650,12 @@ def optimize_circuit_utility(
             "p1": int(cand.get("patch1")),
             "p2": int(cand.get("patch2")),
             "distance": float(cand.get("distance_m", 1.0) or 1.0),
-            "type": "primary",
+            "type": pick.corr_type,
             "variant": cand.get("variant"),
             "source": cand.get("source"),
-            "utility_score": float(_get_base_roi(cand) or 0.0),
-            "overlap_ratio": 0.0,
+            "utility_score": float(pick.score),
+            "overlap_ratio": float(pick.overlap_ratio),
         }
-
-        anchor = int(pids[0])
-        for other in pids[1:]:
-            uf.union(anchor, int(other))
-        remaining -= cost
-
-    # ------------------------------------------------------------------
-    # Phase 2: Circuit utility (redundancy/shortcuts) with remaining budget
-    # ------------------------------------------------------------------
-    # This mirrors core_select.select_circuit_utility, but seeds from the Phase 1 unions.
-    selected_overlap_by_pair: Dict[Tuple[int, int], List[QgsGeometry]] = defaultdict(list)
-    selected_count_by_pair: Dict[Tuple[int, int], int] = defaultdict(int)
-    for data in selected.values():
-        try:
-            pk = _get_pair({"patch1": data.get("p1"), "patch2": data.get("p2")})
-            g = data.get("geom")
-            if g is not None and not g.isEmpty():
-                selected_overlap_by_pair.setdefault(pk, []).append(clone_geometry(g))
-                selected_count_by_pair[pk] = selected_count_by_pair.get(pk, 0) + 1
-        except Exception:
-            continue
-
-    heap: List[Tuple[float, int, int, Dict]] = []
-    stamps: Dict[int, int] = {}
-    counter = 0
-
-    def _stamp_key(cand: Dict) -> int:
-        return id(cand)
-
-    for cand in candidates:
-        base = float(_get_base_roi(cand) or 0.0)
-        cost = float(_candidate_cost_ha(cand) or 0.0)
-        geom = cand.get("geom")
-        if base <= 0.0 or cost <= 0.0 or geom is None or geom.isEmpty():
-            continue
-        if cost > remaining:
-            continue
-        counter += 1
-        k = _stamp_key(cand)
-        stamps[k] = stamps.get(k, 0) + 1
-        heapq.heappush(heap, (-base, counter, stamps[k], cand))
-
-    primary_links = len(selected)
-    redundant_links = 0
-    wasteful_links = 0
-
-    while heap and remaining > 0:
-        neg_score, _idx, stamp, cand = heapq.heappop(heap)
-        k = _stamp_key(cand)
-        if stamps.get(k, 0) != int(stamp):
-            continue
-        old_score = -float(neg_score)
-
-        cost = float(_candidate_cost_ha(cand) or 0.0)
-        if cost <= 0.0 or cost > remaining:
-            continue
-        base_roi = float(_get_base_roi(cand) or 0.0)
-        if base_roi <= 0.0:
-            continue
-
-        pids = [int(pid) for pid in _get_patch_ids(cand) if pid is not None]
-        if len(pids) < 2:
-            continue
-        roots = {int(uf.find(pid)) for pid in pids}
-
-        pair = _get_pair(cand)
-        overlap_r = 0.0
-        if len(roots) > 1:
-            mult = 1.0
-        else:
-            prior = selected_overlap_by_pair.get(pair, [])
-            overlap_r = float(_overlap_ratio(cand, prior) or 0.0)
-            if overlap_r > float(overlap_reject_ratio):
-                mult = 0.01
-            else:
-                mult = float(0.5) ** (int(selected_count_by_pair.get(pair, 0)) + 1)
-
-        new_score = base_roi * mult
-        if abs(new_score - old_score) > 1e-12:
-            counter += 1
-            stamps[k] = stamps.get(k, 0) + 1
-            heapq.heappush(heap, (-new_score, counter, stamps[k], cand))
-            continue
-
-        if mult >= 1.0:
-            corr_type = "primary"
-            primary_links += 1
-        else:
-            corr_type = "redundant"
-            redundant_links += 1
-            if mult <= 0.01:
-                corr_type = "wasteful"
-                wasteful_links += 1
-
-        cid = len(selected) + 1
-        selected[cid] = {
-            "geom": clone_geometry(cand["geom"]),
-            "patch_ids": set(cand.get("patch_ids", set(pids))),
-            "area_ha": float(cand.get("area_ha", 0.0) or 0.0),
-            "p1": int(cand.get("patch1")),
-            "p2": int(cand.get("patch2")),
-            "distance": float(cand.get("distance_m", 1.0) or 1.0),
-            "type": corr_type,
-            "variant": cand.get("variant"),
-            "source": cand.get("source"),
-            "utility_score": float(new_score),
-            "overlap_ratio": float(overlap_r),
-        }
-
-        anchor = int(pids[0])
-        for other in pids[1:]:
-            uf.union(anchor, int(other))
-
-        remaining -= cost
-        obj = cand.get("geom")
-        if obj is not None and not obj.isEmpty():
-            lst = selected_overlap_by_pair.setdefault(pair, [])
-            lst.append(clone_geometry(obj))
-            if len(lst) > 3:
-                del lst[0]
-        selected_count_by_pair[pair] = selected_count_by_pair.get(pair, 0) + 1
 
     # Component areas and per-corridor connected area
     comp_area: Dict[int, float] = defaultdict(float)
@@ -2679,16 +2674,17 @@ def optimize_circuit_utility(
         area = float(data.get("area_ha", 0.0) or 0.0)
         data["efficiency"] = (connected_area / area) if area else 0.0
 
+    budget_used = float(base_stats.get("budget_used", 0.0) or 0.0)
     stats = {
         "strategy": "circuit_utility",
         "corridors_used": len(selected),
-        "budget_used_ha": float((params.budget_area or 0.0) - remaining),
+        "budget_used_ha": budget_used,
         "patches_total": len(patches),
         "patches_connected": largest_group_patches,
         "components_remaining": len(comp_area) if comp_area else len(patches),
-        "primary_links": int(primary_links),
-        "redundant_links": int(redundant_links),
-        "wasteful_links": int(wasteful_links),
+        "primary_links": int(base_stats.get("primary_links", 0) or 0),
+        "redundant_links": int(base_stats.get("redundant_links", 0) or 0),
+        "wasteful_links": int(base_stats.get("wasteful_links", 0) or 0),
         "total_connected_area_ha": sum(p.get("area_ha", 0.0) for p in patches.values()),
         "largest_group_area_ha": largest_group_area,
         "largest_group_patches": largest_group_patches,
@@ -2808,8 +2804,36 @@ def optimize_circuit_utility_largest_network(
     selected: Dict[int, Dict] = {}
 
     uf = UnionFind()
-    for pid in patches:
+    for pid, pdata in patches.items():
         uf.find(int(pid))
+        uf.size[int(pid)] = float(pdata.get("area_ha", 0.0) or 0.0)
+        uf.count[int(pid)] = 1
+
+    G = None
+    if nx is not None:
+        try:
+            G = nx.Graph()
+            G.add_nodes_from([int(pid) for pid in patches.keys()])
+        except Exception:
+            G = None
+
+    def _shortcut_multiplier(p1: int, p2: int, length: float) -> float:
+        if length <= 0:
+            return float(SHORTCUT_MULT_LOW)
+        if G is None:
+            return float(SHORTCUT_MULT_LOW)
+        try:
+            current_len = float(nx.shortest_path_length(G, p1, p2, weight="weight"))
+        except Exception:
+            return float(SHORTCUT_MULT_LOW)
+        ratio = current_len / max(length, 1e-9)
+        if ratio >= float(SHORTCUT_RATIO_HIGH):
+            return float(SHORTCUT_MULT_HIGH)
+        if ratio >= float(SHORTCUT_RATIO_MID):
+            return float(SHORTCUT_MULT_MID)
+        if ratio <= float(SHORTCUT_RATIO_LOW):
+            return float(SHORTCUT_MULT_LOW)
+        return float(SHORTCUT_MULT_LOW)
 
     def _main_root() -> int:
         return int(uf.find(int(seed_patch)))
@@ -2842,9 +2866,22 @@ def optimize_circuit_utility_largest_network(
             continue
         bridge_ranked.append(cand)
 
+    def _primary_score(cand: Dict) -> float:
+        base_roi = float(_get_base_roi(cand) or 0.0)
+        if base_roi <= 0.0:
+            return 0.0
+        pids = [int(pid) for pid in _get_patch_ids(cand) if pid is not None]
+        if len(pids) < 2:
+            return 0.0
+        sizes = [float(_patch_area_ha(pid) or 0.0) for pid in pids]
+        target_importance = min(sizes) if sizes else 1.0
+        if target_importance <= 0:
+            target_importance = 1.0
+        return base_roi * target_importance
+
     bridge_ranked.sort(
         key=lambda c: (
-            float(c.get("distance_m", float("inf")) or float("inf")),
+            -_primary_score(c),
             float(c.get("area_ha", float("inf")) or float("inf")),
         )
     )
@@ -2866,6 +2903,11 @@ def optimize_circuit_utility_largest_network(
             continue
 
         base_roi = float(_get_base_roi(cand) or 0.0)
+        target_sizes = [float(_patch_area_ha(pid) or 0.0) for pid in pids]
+        target_importance = min(target_sizes) if target_sizes else 1.0
+        if target_importance <= 0:
+            target_importance = 1.0
+        base_roi = base_roi * target_importance
         cid = len(selected) + 1
         selected[cid] = {
             "geom": clone_geometry(cand["geom"]),
@@ -2885,6 +2927,13 @@ def optimize_circuit_utility_largest_network(
         for other in pids[1:]:
             uf.union(anchor, int(other))
         remaining -= cost
+        if G is not None:
+            try:
+                length = float(cand.get("distance_m", cost) or cost)
+                for other in pids[1:]:
+                    G.add_edge(anchor, int(other), weight=float(length))
+            except Exception:
+                pass
 
         pk = _get_pair(cand)
         g = cand.get("geom")
@@ -2947,7 +2996,11 @@ def optimize_circuit_utility_largest_network(
             # Only allow bridges that expand the main component.
             if not _touches_main_and_other(pids):
                 continue
-            mult = 1.0
+            root_sizes = [float(uf.size.get(r, 0.0) or 0.0) for r in roots]
+            target_importance = min(root_sizes) if root_sizes else 1.0
+            if target_importance <= 0:
+                target_importance = 1.0
+            mult = float(target_importance)
         else:
             # Only allow redundancy within the main component.
             if int(next(iter(roots))) != mr:
@@ -2958,7 +3011,8 @@ def optimize_circuit_utility_largest_network(
             if overlap_r > float(overlap_reject_ratio):
                 mult = 0.01
             else:
-                mult = float(0.5) ** (int(selected_count_by_pair.get(pair, 0)) + 1)
+                length = float(cand.get("distance_m", cost) or cost)
+                mult = _shortcut_multiplier(int(pids[0]), int(pids[-1]), float(length))
 
         new_score = base_roi * mult
         if abs(new_score - old_score) > 1e-12:
@@ -2967,13 +3021,13 @@ def optimize_circuit_utility_largest_network(
             heapq.heappush(heap, (-new_score, counter, stamps[k], cand))
             continue
 
-        if mult >= 1.0:
+        if len(roots) > 1:
             corr_type = "primary"
             primary_links += 1
         else:
             corr_type = "redundant"
             redundant_links += 1
-            if mult <= 0.01:
+            if mult <= float(SHORTCUT_MULT_LOW) or mult <= 0.01:
                 corr_type = "wasteful"
                 wasteful_links += 1
 
@@ -3005,6 +3059,13 @@ def optimize_circuit_utility_largest_network(
             if len(lst) > 3:
                 del lst[0]
         selected_count_by_pair[pair] = selected_count_by_pair.get(pair, 0) + 1
+        if G is not None:
+            try:
+                length = float(cand.get("distance_m", cost) or cost)
+                for other in pids[1:]:
+                    G.add_edge(anchor, int(other), weight=float(length))
+            except Exception:
+                pass
 
     comp_area: Dict[int, float] = defaultdict(float)
     comp_count: Dict[int, int] = defaultdict(int)
@@ -3044,35 +3105,52 @@ def _thicken_corridors(
     corridors: Dict[int, Dict],
     remaining_budget: float,
     params: VectorRunParams,
-    max_width_factor: float = 5.0,
+    patches: Dict[int, Dict],
+    max_width_factor: float = 3.0,
 ) -> float:
     """
     Use remaining budget to widen existing corridors up to a max factor of the base width.
+    Prioritize corridors adjacent to the largest patch.
     Returns additional budget used.
     """
     if remaining_budget <= 0 or not corridors:
         return 0.0
 
     print(f"\n  Thickening corridors with remaining budget: {remaining_budget:.4f} ha")
+
+    try:
+        largest_patch = max(patches.items(), key=lambda kv: kv[1].get("area_ha", 0.0))[0]
+    except Exception:
+        largest_patch = None
+
+    ordered = list(corridors.keys())
+    if largest_patch is not None:
+        ordered = [cid for cid in ordered if largest_patch in corridors[cid].get("patch_ids", set())] + [
+            cid for cid in ordered if largest_patch not in corridors[cid].get("patch_ids", set())
+        ]
+
     budget_used = 0.0
-    max_buffer = (params.min_corridor_width * (max_width_factor - 1)) / 2.0
-    buffer_step = params.min_corridor_width * 0.1  # grow by 10% of base width per pass
-    current_buffer = 0.0
+    max_width_factor = max(1.0, float(max_width_factor))
 
-    while budget_used < remaining_budget and current_buffer < max_buffer:
-        current_buffer = min(current_buffer + buffer_step, max_buffer)
-        step_cost = 0.0
-        temp_updates: Dict[int, Tuple[QgsGeometry, float]] = {}
+    for cid in ordered:
+        if remaining_budget <= 0:
+            break
+        cdata = corridors.get(cid) or {}
+        base_geom = cdata.get("_thicken_base_geom")
+        if base_geom is None:
+            base_geom = clone_geometry(cdata.get("geom"))
+            cdata["_thicken_base_geom"] = base_geom
+        if base_geom is None or base_geom.isEmpty():
+            continue
 
-        for cid, cdata in corridors.items():
-            base_geom = cdata.get("_thicken_base_geom")
-            if base_geom is None:
-                base_geom = clone_geometry(cdata.get("geom"))
-                cdata["_thicken_base_geom"] = base_geom
-            if base_geom is None or base_geom.isEmpty():
+        current_factor = float(cdata.get("_thicken_factor", 1.0))
+        start_factor = int(math.floor(current_factor))
+        for factor in range(start_factor + 1, int(math.floor(max_width_factor)) + 1):
+            buffer_dist = (params.min_corridor_width * (factor - 1)) / 2.0
+            if buffer_dist <= 0:
                 continue
             try:
-                thickened_geom = base_geom.buffer(current_buffer, BUFFER_SEGMENTS)
+                thickened_geom = base_geom.buffer(buffer_dist, BUFFER_SEGMENTS)
             except Exception:
                 continue
             if thickened_geom is None or thickened_geom.isEmpty():
@@ -3081,26 +3159,293 @@ def _thicken_corridors(
             old_area = float(cdata.get("area_ha", new_area))
             added_area = new_area - old_area
             if added_area <= 0:
+                cdata["_thicken_factor"] = float(factor)
                 continue
-            step_cost += added_area
-            temp_updates[cid] = (thickened_geom, new_area)
+            if added_area > remaining_budget:
+                print("  Budget exhausted; stopping.")
+                return budget_used
 
-        if budget_used + step_cost > remaining_budget or not temp_updates:
-            print("  Budget exhausted or no further thickening possible; stopping.")
-            break
+            remaining_budget -= added_area
+            budget_used += added_area
+            cdata["geom"] = thickened_geom
+            cdata["area_ha"] = new_area
+            cdata["_thicken_factor"] = float(factor)
+            if cdata.get("connected_area_ha") is not None:
+                conn = float(cdata.get("connected_area_ha") or 0.0)
+                cdata["efficiency"] = (conn / new_area) if new_area else 0.0
+            print(f"    - Corridor {cid} thickened to {factor:.0f}x width (Cost: {added_area:.4f} ha)")
 
-        for cid, (geom, new_area) in temp_updates.items():
-            corridors[cid]["geom"] = geom
-            corridors[cid]["area_ha"] = new_area
-
-        budget_used += step_cost
-        print(f"    - Thickened by {current_buffer * 2:.1f} m (Cost: {step_cost:.4f} ha)")
-        if current_buffer >= max_buffer:
-            print(f"  Maximum corridor width reached ({max_width_factor}x min width).")
-            break
-
-    print(f"  ✓ Finalized thickening. Total extra budget used: {budget_used:.4f} ha")
+    if budget_used:
+        print(f"  ✓ Finalized thickening. Total extra budget used: {budget_used:.4f} ha")
     return budget_used
+
+
+def _apply_hybrid_leftover_budget_vector(
+    patches: Dict[int, Dict],
+    candidates: List[Dict],
+    corridors: Dict[int, Dict],
+    remaining_budget: float,
+    roi_bias: float = ROI_REDUNDANCY_BIAS,
+    max_links_per_pair: int = HYBRID_MAX_LINKS_PER_PAIR,
+    overlap_reject_ratio: float = HYBRID_OVERLAP_REJECT_RATIO,
+) -> Tuple[float, int, int]:
+    """
+    Spend remaining budget by comparing low-value connections vs redundancy.
+    Returns (budget_used, low_value_added, redundancy_added).
+    """
+    if remaining_budget <= 0 or not candidates:
+        return 0.0, 0, 0
+
+    def _pair_key(a: int, b: int) -> Tuple[int, int]:
+        return (a, b) if a <= b else (b, a)
+
+    uf = UnionFind()
+    for pid, pdata in patches.items():
+        uf.find(int(pid))
+        uf.size[int(pid)] = float(pdata.get("area_ha", 0.0) or 0.0)
+        uf.count[int(pid)] = 1
+    for data in corridors.values():
+        pids = list(data.get("patch_ids", {data.get("p1"), data.get("p2")}))
+        pids = [int(pid) for pid in pids if pid is not None]
+        if len(pids) < 2:
+            continue
+        anchor = pids[0]
+        for other in pids[1:]:
+            uf.union(anchor, int(other))
+
+    roots = {int(uf.find(int(pid))) for pid in patches}
+    if not roots:
+        return 0.0, 0, 0
+    main_root = max(roots, key=lambda r: uf.size.get(r, 0.0))
+
+    selected_count_by_pair: Dict[Tuple[int, int], int] = defaultdict(int)
+    selected_geoms_by_pair: Dict[Tuple[int, int], List[QgsGeometry]] = defaultdict(list)
+    for data in corridors.values():
+        p1, p2 = data.get("p1"), data.get("p2")
+        if p1 is None or p2 is None:
+            continue
+        pk = _pair_key(int(p1), int(p2))
+        selected_count_by_pair[pk] = selected_count_by_pair.get(pk, 0) + 1
+        g = data.get("geom")
+        if g is not None and not g.isEmpty():
+            selected_geoms_by_pair[pk].append(clone_geometry(g))
+
+    G = None
+    if nx is not None and graph_math is not None:
+        G = nx.Graph()
+        for pid in patches:
+            G.add_node(int(pid))
+        for data in corridors.values():
+            p1, p2 = data.get("p1"), data.get("p2")
+            if p1 is None or p2 is None:
+                continue
+            dist = float(data.get("distance", 1.0) or 1.0)
+            G.add_edge(int(p1), int(p2), weight=dist)
+
+    budget_used = 0.0
+    low_value_added = 0
+    redundancy_added = 0
+
+    while remaining_budget > 0:
+        best_new: Optional[Tuple[float, Dict, float]] = None
+        best_red: Optional[Tuple[float, Dict, float]] = None
+
+        for cand in candidates:
+            cost = float(cand.get("area_ha", 0.0) or 0.0)
+            if cost <= 0.0 or cost > remaining_budget:
+                continue
+            geom = cand.get("geom")
+            if geom is None or geom.isEmpty():
+                continue
+            p1, p2 = cand.get("patch1"), cand.get("patch2")
+            if p1 is None or p2 is None:
+                continue
+            p1i, p2i = int(p1), int(p2)
+            pk = _pair_key(p1i, p2i)
+
+            pids = list(cand.get("patch_ids", {p1i, p2i}))
+            pids = [int(pid) for pid in pids if pid is not None]
+            roots = {int(uf.find(pid)) for pid in pids}
+            if not roots:
+                continue
+
+            if len(roots) > 1:
+                if main_root not in roots:
+                    continue
+                gain = sum(float(uf.size.get(r, 0.0) or 0.0) for r in roots if r != main_root)
+                roi_new = (gain / cost) if cost else 0.0
+                if roi_new > 0 and (best_new is None or roi_new > best_new[0]):
+                    best_new = (roi_new, cand, gain)
+                continue
+
+            if main_root not in roots:
+                continue
+            if selected_count_by_pair.get(pk, 0) >= max_links_per_pair:
+                continue
+            prior_geoms = selected_geoms_by_pair.get(pk, [])
+            overlap = _geom_overlap_ratio(geom, prior_geoms)
+            if overlap >= float(overlap_reject_ratio):
+                continue
+            dist = float(cand.get("distance_m", 1.0) or 1.0)
+            score = 0.0
+            if G is not None and graph_math is not None:
+                try:
+                    if nx.has_path(G, p1i, p2i):
+                        score = float(graph_math.score_edge_for_loops(G, p1i, p2i, dist))
+                except Exception:
+                    score = 0.0
+            if score <= 0.0:
+                continue
+            roi_red = score / cost if cost else 0.0
+            if roi_red > 0 and (best_red is None or roi_red > best_red[0]):
+                best_red = (roi_red, cand, overlap)
+
+        if best_new is None and best_red is None:
+            break
+
+        pick_red = False
+        if best_red is not None and best_new is not None:
+            pick_red = best_red[0] > best_new[0] * (1.0 + float(roi_bias))
+        elif best_red is not None:
+            pick_red = True
+
+        roi, cand, extra = best_red if pick_red else best_new
+        if cand is None or roi <= 0.0:
+            break
+
+        cost = float(cand.get("area_ha", 0.0) or 0.0)
+        if cost <= 0.0 or cost > remaining_budget:
+            break
+
+        p1i, p2i = int(cand.get("patch1")), int(cand.get("patch2"))
+        pk = _pair_key(p1i, p2i)
+        pids = list(cand.get("patch_ids", {p1i, p2i}))
+        pids = [int(pid) for pid in pids if pid is not None]
+
+        if pick_red:
+            redundancy_added += 1
+            corr_type = "redundant"
+            overlap_r = float(extra or 0.0)
+        else:
+            low_value_added += 1
+            corr_type = "low_value"
+            overlap_r = 0.0
+
+        if pids:
+            if main_root in {int(uf.find(pid)) for pid in pids}:
+                anchor = next((pid for pid in pids if int(uf.find(pid)) == main_root), pids[0])
+            else:
+                anchor = pids[0]
+            for other in pids[1:]:
+                uf.union(int(anchor), int(other))
+            main_root = int(uf.find(anchor))
+
+        cid = len(corridors) + 1
+        corridors[cid] = {
+            "geom": clone_geometry(cand.get("geom")),
+            "patch_ids": set(cand.get("patch_ids", {p1i, p2i})),
+            "area_ha": float(cand.get("area_ha", 0.0) or 0.0),
+            "p1": p1i,
+            "p2": p2i,
+            "distance": float(cand.get("distance_m", 1.0) or 1.0),
+            "type": corr_type,
+            "variant": cand.get("variant"),
+            "source": cand.get("source"),
+            "utility_score": float(roi),
+            "overlap_ratio": float(overlap_r),
+        }
+        selected_count_by_pair[pk] = selected_count_by_pair.get(pk, 0) + 1
+        geom = cand.get("geom")
+        if geom is not None and not geom.isEmpty():
+            selected_geoms_by_pair[pk].append(clone_geometry(geom))
+
+        remaining_budget -= cost
+        budget_used += cost
+        if G is not None:
+            G.add_edge(p1i, p2i, weight=float(cand.get("distance_m", 1.0) or 1.0))
+
+    return budget_used, low_value_added, redundancy_added
+
+
+def _refresh_vector_connectivity_stats(
+    patches: Dict[int, Dict],
+    corridors: Dict[int, Dict],
+    stats: Dict,
+) -> None:
+    """Recompute connectivity-derived stats after adding corridors."""
+    if not corridors:
+        return
+
+    uf = UnionFind()
+    for pid, pdata in patches.items():
+        uf.find(int(pid))
+        uf.size[int(pid)] = float(pdata.get("area_ha", 0.0) or 0.0)
+        uf.count[int(pid)] = 1
+
+    for data in corridors.values():
+        pids = list(data.get("patch_ids", {data.get("p1"), data.get("p2")}))
+        pids = [int(pid) for pid in pids if pid is not None]
+        if len(pids) < 2:
+            continue
+        anchor = pids[0]
+        for other in pids[1:]:
+            uf.union(anchor, int(other))
+
+    comp_area: Dict[int, float] = defaultdict(float)
+    comp_count: Dict[int, int] = defaultdict(int)
+    for pid in patches:
+        root = int(uf.find(int(pid)))
+        comp_area[root] += float(patches[pid].get("area_ha", 0.0) or 0.0)
+        comp_count[root] += 1
+
+    largest_group_area = max(comp_area.values()) if comp_area else 0.0
+    largest_group_patches = max(comp_count.values()) if comp_count else 0
+
+    if "components_remaining" in stats:
+        stats["components_remaining"] = len(comp_area) if comp_area else len(patches)
+    if "largest_group_area_ha" in stats:
+        stats["largest_group_area_ha"] = float(largest_group_area)
+    if "largest_group_patches" in stats:
+        stats["largest_group_patches"] = int(largest_group_patches)
+    if "patches_connected" in stats:
+        if stats.get("strategy") == "largest_network" or stats.get("mode") == "Largest Network":
+            stats["patches_connected"] = len(patches)
+        else:
+            stats["patches_connected"] = int(largest_group_patches)
+    if "total_connected_area_ha" in stats:
+        stats["total_connected_area_ha"] = sum(float(p.get("area_ha", 0.0) or 0.0) for p in patches.values())
+
+    use_global = stats.get("strategy") == "largest_network" or stats.get("mode") == "Largest Network"
+    for data in corridors.values():
+        if use_global:
+            connected_area = largest_group_area
+        else:
+            root = int(uf.find(int(data.get("p1"))))
+            connected_area = float(comp_area.get(root, 0.0) or 0.0)
+        data["connected_area_ha"] = float(connected_area)
+        area = float(data.get("area_ha", 0.0) or 0.0)
+        data["efficiency"] = (connected_area / area) if area else 0.0
+
+    if graph_math is None:
+        return
+
+    final_corridors = []
+    for cid, data in corridors.items():
+        p1, p2 = data.get("p1"), data.get("p2")
+        if p1 is None or p2 is None:
+            continue
+        final_corridors.append(
+            {"id": cid, "patch1": int(p1), "patch2": int(p2), "distance_m": float(data.get("distance", 1.0) or 1.0)}
+        )
+
+    try:
+        G_final = graph_math.build_graph_from_corridors(patches, final_corridors)
+        if "entropy_total" in stats:
+            stats["entropy_total"] = graph_math.calculate_total_entropy(G_final).get("H_total", 0.0)
+        if "robustness_rho2" in stats:
+            stats["robustness_rho2"] = graph_math.calculate_two_edge_connectivity(G_final)
+    except Exception:
+        return
 
 
 def write_corridors_layer_to_gpkg(
@@ -3732,13 +4077,42 @@ def run_vector_analysis(
     if not corridors:
         raise VectorAnalysisError(_format_no_corridor_reason("Optimization", len(patches), len(all_possible), params))
 
+    remaining_budget = float((params.budget_area or 0.0) - float(stats.get("budget_used_ha", 0.0) or 0.0))
+    if remaining_budget > 0 and corridors:
+        with timings.time_block("Hybrid leftover budget"):
+            extra_used, low_value_added, redundancy_added = _apply_hybrid_leftover_budget_vector(
+                patches=patches,
+                candidates=all_possible,
+                corridors=corridors,
+                remaining_budget=remaining_budget,
+            )
+        if extra_used:
+            stats["budget_used_ha"] = float(stats.get("budget_used_ha", 0.0) or 0.0) + float(extra_used)
+            stats["corridors_used"] = len(corridors)
+            if "primary_links" in stats:
+                stats["primary_links"] = int(stats.get("primary_links", 0) or 0) + int(low_value_added)
+            if "redundant_links" in stats:
+                stats["redundant_links"] = int(stats.get("redundant_links", 0) or 0) + int(redundancy_added)
+            _refresh_vector_connectivity_stats(patches, corridors, stats)
+        remaining_budget = float((params.budget_area or 0.0) - float(stats.get("budget_used_ha", 0.0) or 0.0))
+
     # Consistent connectivity metrics for all optimization modes
     try:
         stats.update(_compute_connectivity_metrics(corridors, patches))
     except Exception:
         pass
 
-    timings.add("Thicken corridors (removed)", 0.0)
+    if remaining_budget > 0 and corridors:
+        with timings.time_block("Thicken corridors"):
+            extra_used = _thicken_corridors(
+                corridors=corridors,
+                remaining_budget=remaining_budget,
+                params=params,
+                patches=patches,
+                max_width_factor=3.0,
+            )
+        if extra_used:
+            stats["budget_used_ha"] = float(stats.get("budget_used_ha", 0.0) or 0.0) + float(extra_used)
 
     stats = _convert_stats_for_units(stats, unit_system)
     stats["budget_total_display"] = params.budget_area * area_factor
@@ -3746,20 +4120,6 @@ def run_vector_analysis(
     print("  Preparing outputs...")
     emit_progress(progress_cb, 90, "Writing outputs…")
     with timings.time_block("Write corridor outputs"):
-        if temporary:
-            create_memory_layer_from_corridors(corridors, layer_name, target_crs, original_crs, unit_system)
-        else:
-            write_corridors_layer_to_gpkg(
-                corridors,
-                output_path,
-                layer_name,
-                target_crs,
-                original_crs,
-                unit_system,
-                overwrite_file=True,
-            )
-            add_layer_to_qgis_from_gpkg(output_path, layer_name)
-
         # Contiguous network areas (patches + corridors dissolved per connected network)
         networks: List[Dict] = []
         try:
@@ -3768,6 +4128,15 @@ def run_vector_analysis(
             if temporary:
                 create_memory_layer_from_networks(networks, networks_layer_name, target_crs, original_crs, unit_system)
             else:
+                write_corridors_layer_to_gpkg(
+                    corridors,
+                    output_path,
+                    layer_name,
+                    target_crs,
+                    original_crs,
+                    unit_system,
+                    overwrite_file=True,
+                )
                 write_contiguous_networks_layer_to_gpkg(
                     networks,
                     output_path,
@@ -3777,9 +4146,12 @@ def run_vector_analysis(
                     unit_system,
                 )
                 add_layer_to_qgis_from_gpkg(output_path, networks_layer_name)
+                add_layer_to_qgis_from_gpkg(output_path, layer_name)
         except Exception as net_exc:  # noqa: BLE001
             print(f"  ⚠ Could not write contiguous areas layer: {net_exc}")
             networks = []
+        if temporary:
+            create_memory_layer_from_corridors(corridors, layer_name, target_crs, original_crs, unit_system)
 
         # --- LANDSCAPE METRICS REPORT (always written) ---
         landscape_metrics_path = ""
@@ -3793,10 +4165,21 @@ def run_vector_analysis(
                 strategy_label = "Circuit Theory"
 
             analysis_layer_name = f"Contiguous Areas ({strategy_label})"
+            pixel_size_m = float(getattr(params, "grid_resolution", 50.0) or 50.0)
+            patch_geoms = [pdata.get("geom") for pdata in patches.values() if pdata.get("geom") and not pdata.get("geom").isEmpty()]
+            network_geoms = [net.get("geom") for net in networks if net.get("geom") and not net.get("geom").isEmpty()]
+            bounds = _compute_geoms_bounds(patch_geoms + network_geoms)
             mask, eff_px = _rasterize_networks_to_mask(
                 networks=networks,
-                pixel_size_m=float(getattr(params, "grid_resolution", 50.0) or 50.0),
+                pixel_size_m=pixel_size_m,
                 target_crs=target_crs,
+                bounds=bounds,
+            )
+            pre_mask, _ = _rasterize_geoms_to_mask(
+                geoms=patch_geoms,
+                pixel_size_m=pixel_size_m,
+                target_crs=target_crs,
+                bounds=bounds,
             )
             from .analysis_raster import _perform_landscape_analysis  # local import avoids hard coupling at import time
 
@@ -3807,6 +4190,7 @@ def run_vector_analysis(
                 res_y=float(eff_px),
                 is_metric=True,
                 params=None,
+                pre_arr=pre_mask,
             )
 
             if temporary:
@@ -3893,6 +4277,50 @@ def run_vector_analysis(
     stats["layer_name"] = layer_name
     stats["output_path"] = output_path if not temporary else ""
     stats["unit_system"] = unit_system
+    try:
+        safe = _safe_filename(layer.name())
+        if temporary:
+            temp_file = tempfile.NamedTemporaryFile(
+                prefix="terralink_vector_summary_", suffix=".csv", delete=False
+            )
+            summary_path = temp_file.name
+            temp_file.close()
+        else:
+            summary_path = os.path.join(summary_dir, f"terralink_vector_summary_{safe}_{strategy_key}.csv")
+        rows = [
+            ("Input layer", layer.name()),
+            ("Strategy", strategy_label),
+            ("Corridors created", str(stats.get("corridors_used", 0))),
+            ("Patches connected", str(stats.get("patches_connected", 0))),
+            ("Connected groups", str(stats.get("components_remaining", 0))),
+            ("Total connected area", f"{_format_number(stats.get('total_connected_area_display', 0))} {area_label}"),
+            ("Largest group area", f"{_format_number(stats.get('largest_group_area_display', 0))} {area_label}"),
+            ("Budget used", f"{_format_number(stats.get('budget_used_display', 0))} {area_label}"),
+            ("Budget total", f"{_format_number(params.budget_area * area_factor)} {area_label}"),
+            ("Output GPKG", output_path if not temporary else ""),
+            ("Corridors layer", layer_name),
+            ("Contiguous areas layer", "Contiguous Areas"),
+            ("Landscape metrics", str(stats.get("landscape_metrics_path", ""))),
+            ("Processing time (s)", _format_number(elapsed, 1)),
+        ]
+        if "primary_links" in stats:
+            rows.append(("Primary links", str(stats.get("primary_links", 0))))
+        if "redundant_links" in stats:
+            rows.append(("Redundant links", str(stats.get("redundant_links", 0))))
+        if "wasteful_links" in stats:
+            rows.append(("Wasteful links", str(stats.get("wasteful_links", 0))))
+        if "avg_degree" in stats:
+            rows.append(("Average degree", _format_number(stats.get("avg_degree", 0), 2)))
+        if "entropy_total" in stats:
+            rows.append(("Entropy (H_total)", _format_number(stats.get("entropy_total", 0), 4)))
+        if "robustness_rho2" in stats:
+            rows.append(("Robustness (rho2)", _format_number(stats.get("robustness_rho2", 0), 4)))
+        _write_summary_csv(summary_path, rows)
+        stats["summary_csv_path"] = summary_path
+        print(f"  ✓ Saved vector summary CSV: {summary_path}")
+        _add_summary_csv_layer(summary_path, f"TerraLink Vector Summary ({layer.name()})")
+    except Exception:
+        pass
 
     return [
         {

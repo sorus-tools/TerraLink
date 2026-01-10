@@ -1,4 +1,4 @@
-# TerraLink QGIS Plugin v1.1.0
+# TerraLink QGIS Plugin 1.3
 
 **Ecological Corridor Optimization for Habitat Connectivity**
 
@@ -9,26 +9,16 @@ Image: Corridors generated (pink) to strategically connect the maximum landscape
 
 ---
 
-## What’s New in v1.1.0
+## What’s New in 1.3
 
-- **Explicit optimization strategies**
-  - Two modes: **Largest Network** and **Circuit Theory**
-  - Circuit Theory prioritizes corridors with the highest marginal connectivity gain and allows ecologically meaningful redundancy.
-
-- **Improved corridor selection**
-  - Avoids redundant or overlapping corridors unless they add real connectivity value.
-  - Remaining budget is preferentially used to reinforce existing corridors rather than create low-value links.
-
-- **Vector mode: boundary-aware connectivity**
-  - Patch connections use true boundary distances instead of centroids.
-  - Multiple boundary terminals are sampled so narrow peninsulas or patch tips can connect realistically.
-
-- **Impassible Landclass and Barrier routing**
-  - When impassable polygon layers are enabled, TerraLink routes corridors around barriers using an internal navigator grid.
-  - Optional smoothing reduces stair-step artifacts from grid-based routing.
-
-- **Landscape metrics report**
-  - Each run writes a plain-text landscape metrics summary describing patch count, connected area, fragmentation, and network structure.
+- **Pre/Post landscape metrics**
+  - Landscape metrics tables now include PRE and POST values for connectivity impact.
+- **Leftover budget behavior**
+  - Remaining budget can add low-value links, then thicken corridors up to 3x width.
+- **Vector summary outputs**
+  - Vector runs now write a summary CSV and load it as a table layer in QGIS.
+- **Output layer order**
+  - Corridors are added above contiguous areas in QGIS for both raster and vector runs.
 
 ## Table of Contents
 
@@ -49,13 +39,13 @@ Image: Corridors generated (pink) to strategically connect the maximum landscape
 
 ### What TerraLink Does
 
-TerraLink analyzes habitat patches (either raster cells or vector polygons) and identifies corridors that connect them based on:  
+TerraLink analyzes habitat patches (either raster cells or vector polygons) and identifies potential corridors that connect them based on:  
 
 - Available budget in pixels or area units  
 - Spatial constraints like maximum search distance and minimum corridor width  
 - Optimization mode (Largest Network vs Circuit Theory)  
 
-The plugin supports both raster and vector workflows so you can work directly with land cover grids or polygon habitat maps.
+The plugin supports both raster and vector workflows so you can work directly with LULC data or polygon habitat maps.
 
 ### Key Features
 
@@ -133,7 +123,7 @@ You can also launch it from the Processing Toolbox under `TerraLink → TerraLin
 
 7. **Run and review**  
    - Click **Run**. Watch progress in the **Log** tab.  
-   - Outputs are added to your QGIS project; raster runs also add a “TerraLink Raster Summary …” table layer.  
+   - Outputs are added to your QGIS project; raster and vector runs also add summary table layers.  
    - After a successful run, the Run button becomes **Close** to avoid accidental re-runs.  
 
 ---
@@ -193,7 +183,7 @@ TerraLink supports two optimization modes:
 
 ### Circuit Theory
 
-- Goal: maximize system-wide utility (ROI) under the budget; can favor robust redundant links between major hubs.
+- Goal: maximize system-wide utility (ROI) under the budget; redundant links are scored by shortcut efficiency.
 
 ---
 
@@ -206,7 +196,7 @@ For each run, TerraLink can produce:
 - Corridor raster where pixel values indicate the size (in pixels) of the connected component created by including that corridor cell.  
 - Contiguous areas raster where pixel values indicate the size (in pixels) of the connected component for all habitat and corridor cells.  
 - A small in-project summary table layer: `TerraLink Raster Summary (<input layer>)`.
-- A plain-text landscape metrics report saved alongside the other outputs (or as a temporary file when using temporary outputs).
+- A plain-text landscape metrics report (PRE/POST) saved alongside the other outputs (or as a temporary file when using temporary outputs).
 
 ### Vector mode outputs
 
@@ -214,12 +204,13 @@ For each run, TerraLink can produce:
   - Patch ids it connects  
   - Length and cost  
   - Connected area and strategy statistics  
-- A plain-text landscape metrics report saved alongside the other outputs (or as a temporary file when using temporary outputs).
+- A plain-text landscape metrics report (PRE/POST) saved alongside the other outputs (or as a temporary file when using temporary outputs).
+- A summary CSV saved alongside the other outputs (or as a temporary file), also added to QGIS as a table layer.
 
 ### Run summaries
 
 - The **Log** tab provides a concise run summary suitable for copy/paste into notes.
-- Raster runs also add an in-project summary table layer.
+- Raster and vector runs add in-project summary table layers.
 
 ---
 

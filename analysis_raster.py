@@ -84,6 +84,7 @@ GTIFF_OPTIONS = ["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"]
 PIXEL_COUNT_WARNING_THRESHOLD = 40_000_000  # warn when raster exceeds ~40 million pixels
 PIXEL_SIZE_WARNING_THRESHOLD = 10.0  # warn when pixel size < 10 map units
 PIXEL_FINE_CRITICAL_COUNT = 2_000_000  # only block fine rasters when they are also large
+ROI_REDUNDANCY_BIAS = 0.2  # prefer new connections unless redundancy ROI is clearly higher
 
 def _log_message(message: str, level: int = Qgis.Info) -> None:
     """Log to the QGIS Log Messages Panel with a TerraLink tag."""
@@ -165,7 +166,7 @@ def _add_landscape_metrics_table_layer(layer_title: str, analysis_lines: List[st
     if QgsVectorLayer is None or QgsProject is None or QgsFeature is None or QgsField is None:
         return
     try:
-        rows: List[Tuple[str, str, str]] = []
+        rows: List[Tuple[str, str, str, str]] = []
         in_table = False
         for line in analysis_lines or []:
             if (not in_table) and ("METRIC NAME" in line) and ("|" in line):
@@ -185,25 +186,28 @@ def _add_landscape_metrics_table_layer(layer_title: str, analysis_lines: List[st
             parts = [p.strip() for p in s.split("|")]
             if len(parts) < 3:
                 continue
-            metric, value, interp = parts[0], parts[1], parts[2]
+            if len(parts) >= 4:
+                metric, pre_val, post_val, interp = parts[0], parts[1], parts[2], parts[3]
+            else:
+                metric, pre_val, post_val, interp = parts[0], parts[1], "", parts[2]
             if metric:
-                rows.append((metric, value, interp))
+                rows.append((metric, pre_val, post_val, interp))
 
         if not rows:
             joined = " ".join([l.strip() for l in (analysis_lines or []) if l.strip()])[:240]
             if not joined:
                 joined = "No landscape metrics available."
-            rows = [("Message", joined, "")]
+            rows = [("Message", joined, "", "")]
 
-        uri = "None?field=metric:string(80)&field=value:string(40)&field=interpretation:string(120)"
+        uri = "None?field=metric:string(80)&field=pre_value:string(40)&field=post_value:string(40)&field=interpretation:string(120)"
         layer = QgsVectorLayer(uri, layer_title, "memory")
         if not layer.isValid():
             return
         provider = layer.dataProvider()
         feats: List[QgsFeature] = []
-        for metric, value, interp in rows:
+        for metric, pre_val, post_val, interp in rows:
             feat = QgsFeature(layer.fields())
-            feat.setAttributes([metric, value, interp])
+            feat.setAttributes([metric, pre_val, post_val, interp])
             feats.append(feat)
         provider.addFeatures(feats)
         layer.updateExtents()
@@ -1384,12 +1388,21 @@ def create_output_raster(
 ) -> np.ndarray:
     """Create an output raster with corridors marked by connected size."""
     output = np.zeros_like(labels, dtype=np.int32)
-    offsets = _corridor_offsets(min_corridor_width)
     rows, cols = labels.shape
     use_mask = obstacle_mask is not None
 
     for corridor_data in corridors.values():
         score = corridor_data["connected_size"]
+        buffered = corridor_data.get("buffered_pixels")
+        if buffered:
+            for r, c in buffered:
+                if 0 <= r < rows and 0 <= c < cols:
+                    if use_mask and obstacle_mask[r, c]:
+                        continue
+                    if score > output[r, c]:
+                        output[r, c] = score
+            continue
+        offsets = _corridor_offsets(min_corridor_width)
         for r, c in corridor_data["pixels"]:
             for dr, dc in offsets:
                 nr, nc = r + dr, c + dc
@@ -1416,10 +1429,18 @@ def create_combined_raster(
     combined = labels.copy().astype(np.int32)
 
     # Burn corridors as a unique label (negative), then re-label components
-    offsets = _corridor_offsets(min_corridor_width)
     next_label = int(labels.max()) + 1
     corridor_mask = np.zeros_like(labels, dtype=bool)
     for corridor_data in corridors.values():
+        buffered = corridor_data.get("buffered_pixels")
+        if buffered:
+            for r, c in buffered:
+                if 0 <= r < rows and 0 <= c < cols:
+                    if use_mask and obstacle_mask is not None and obstacle_mask[r, c]:
+                        continue
+                    corridor_mask[r, c] = True
+            continue
+        offsets = _corridor_offsets(min_corridor_width)
         for r, c in corridor_data["pixels"]:
             for dr, dc in offsets:
                 nr, nc = r + dr, c + dc
@@ -1491,7 +1512,6 @@ def create_contiguous_network_area_raster(
 
     network_labels = lookup[labels.astype(np.int32)]
 
-    offsets = _corridor_offsets(min_corridor_width)
     use_mask = obstacle_mask is not None
     for corr in corridors.values():
         pids = list(corr.get("patch_ids", []))
@@ -1500,13 +1520,22 @@ def create_contiguous_network_area_raster(
         comp_idx = root_to_idx.get(int(uf.find(int(pids[0]))))
         if comp_idx is None:
             continue
-        for r, c in corr.get("pixels", frozenset()):
-            for dr, dc in offsets:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < rows and 0 <= nc < cols:
-                    if use_mask and obstacle_mask is not None and obstacle_mask[nr, nc]:
+        buffered = corr.get("buffered_pixels")
+        if buffered:
+            for r, c in buffered:
+                if 0 <= r < rows and 0 <= c < cols:
+                    if use_mask and obstacle_mask is not None and obstacle_mask[r, c]:
                         continue
-                    network_labels[nr, nc] = comp_idx
+                    network_labels[r, c] = comp_idx
+        else:
+            offsets = _corridor_offsets(min_corridor_width)
+            for r, c in corr.get("pixels", frozenset()):
+                for dr, dc in offsets:
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < rows and 0 <= nc < cols:
+                        if use_mask and obstacle_mask is not None and obstacle_mask[nr, nc]:
+                            continue
+                        network_labels[nr, nc] = comp_idx
 
         # Include connected habitat pixels used by the corridor path.
         # This ensures small "bridge" patches are present in the contiguous output.
@@ -1637,6 +1666,8 @@ def optimize_resilient(
             "patch_ids": {p1, p2},
             "area": cost,
             "connected_size": conn_size,
+            "buffered_pixels": cand.get("buffered_pixels", frozenset()),
+            "length": float(cand.get("length", cost) or cost),
             "type": "backbone",
         }
 
@@ -1703,6 +1734,8 @@ def optimize_resilient(
                     "patch_ids": {p1, p2},
                     "area": cost,
                     "connected_size": uf.size.get(uf.find(p1), cost),
+                    "buffered_pixels": cand.get("buffered_pixels", frozenset()),
+                    "length": float(cand.get("length", cost) or cost),
                     "type": "strategic_loop",
                 }
         else:
@@ -1731,6 +1764,8 @@ def optimize_resilient(
                     "patch_ids": {p1, p2},
                     "area": cost,
                     "connected_size": uf.size.get(uf.find(p1), cost),
+                    "buffered_pixels": cand.get("buffered_pixels", frozenset()),
+                    "length": float(cand.get("length", cost) or cost),
                     "type": "redundant",
                 }
 
@@ -1833,6 +1868,7 @@ def optimize_largest_network(
             "patch_ids": {p1, p2},
             "area": cost,
             "connected_size": comp_size,
+            "buffered_pixels": cand.get("buffered_pixels", frozenset()),
             "type": "backbone",
         }
 
@@ -1921,6 +1957,7 @@ def optimize_largest_network(
                     "patch_ids": {p1, p2},
                     "area": cost,
                     "connected_size": visited_size,
+                    "buffered_pixels": cand.get("buffered_pixels", frozenset()),
                     "type": "strategic_loop",
                 }
         else:
@@ -1949,6 +1986,7 @@ def optimize_largest_network(
                     "patch_ids": {p1, p2},
                     "area": cost,
                     "connected_size": visited_size,
+                    "buffered_pixels": cand.get("buffered_pixels", frozenset()),
                     "type": "redundant",
                 }
 
@@ -2033,6 +2071,24 @@ def optimize_circuit_utility(
         except Exception:
             return 0.0
 
+    def _get_length(cand: Dict) -> float:
+        try:
+            length = float(cand.get("length", 0) or 0.0)
+        except Exception:
+            length = 0.0
+        if length <= 0.0:
+            try:
+                length = float(_get_cost(cand) or 0.0)
+            except Exception:
+                length = 0.0
+        return length
+
+    def _get_patch_size(pid: int) -> float:
+        try:
+            return float(patch_sizes.get(int(pid), 0) or 0.0)
+        except Exception:
+            return 0.0
+
     def _get_base_roi(cand: Dict) -> float:
         try:
             pids = _get_patch_ids(cand)
@@ -2077,6 +2133,8 @@ def optimize_circuit_utility(
         get_pair_key=_get_pair,
         get_cost=_get_cost,
         get_base_roi=_get_base_roi,
+        get_length=_get_length,
+        get_patch_size=_get_patch_size,
         overlap_ratio=_overlap_ratio,
         overlap_obj=_overlap_obj,
         overlap_reject_ratio=float(overlap_reject_ratio),
@@ -2111,6 +2169,7 @@ def optimize_circuit_utility(
             "patch_ids": {p1, p2},
             "area": cost,
             "connected_size": conn_size,
+            "buffered_pixels": cand.get("buffered_pixels", frozenset()),
             "type": pick.corr_type,
             "utility_score": float(pick.score),
             "overlap_ratio": float(pick.overlap_ratio),
@@ -2142,6 +2201,273 @@ def optimize_circuit_utility(
         "wasteful_links": int(base_stats.get("wasteful_links", 0) or 0),
     }
     return selected, stats
+
+
+def _refresh_raster_component_stats(
+    corridors: Dict[int, Dict],
+    patch_sizes: Dict[int, int],
+    stats: Dict,
+) -> None:
+    """Update connectivity fields in stats after adding corridors."""
+    uf = UnionFind()
+    for pid, size in patch_sizes.items():
+        uf.find(int(pid))
+        uf.size[int(pid)] = int(size)
+        uf.count[int(pid)] = 1
+    for corr in corridors.values():
+        pids = list(corr.get("patch_ids", []))
+        if len(pids) >= 2:
+            uf.union(int(pids[0]), int(pids[1]))
+
+    comp_sizes: Dict[int, int] = {}
+    comp_counts: Dict[int, int] = {}
+    for pid in patch_sizes.keys():
+        root = uf.find(int(pid))
+        comp_sizes[root] = comp_sizes.get(root, 0) + int(patch_sizes.get(pid, 0) or 0)
+        comp_counts[root] = comp_counts.get(root, 0) + 1
+
+    for corr in corridors.values():
+        pids = list(corr.get("patch_ids", []))
+        if not pids:
+            continue
+        root = uf.find(int(pids[0]))
+        corr["connected_size"] = int(comp_sizes.get(root, corr.get("connected_size", 0)) or 0)
+    if comp_sizes:
+        stats["largest_group_size"] = max(comp_sizes.values())
+        stats["total_connected_size"] = sum(comp_sizes.values())
+    if comp_counts:
+        stats["largest_group_patches"] = max(comp_counts.values())
+        stats["patches_connected"] = stats.get("largest_group_patches", 0)
+        stats["components_remaining"] = len(comp_counts)
+    elif patch_sizes:
+        stats["components_remaining"] = len(patch_sizes)
+
+
+def _apply_hybrid_leftover_budget_raster(
+    candidates: List[Dict],
+    corridors: Dict[int, Dict],
+    patch_sizes: Dict[int, int],
+    remaining_budget: int,
+    roi_bias: float = ROI_REDUNDANCY_BIAS,
+) -> Tuple[int, int, int]:
+    """
+    Spend remaining budget by comparing low-value connections vs redundancy.
+    Returns (budget_used, low_value_added, redundancy_added).
+    """
+    if remaining_budget <= 0 or not candidates:
+        return 0, 0, 0
+
+    uf = UnionFind()
+    for pid, size in patch_sizes.items():
+        uf.find(int(pid))
+        uf.size[int(pid)] = int(size)
+        uf.count[int(pid)] = 1
+    for data in corridors.values():
+        pids = list(data.get("patch_ids", []))
+        if len(pids) >= 2:
+            uf.union(int(pids[0]), int(pids[1]))
+
+    roots = {int(uf.find(int(pid))) for pid in patch_sizes}
+    if not roots:
+        return 0, 0, 0
+    main_root = max(roots, key=lambda r: uf.size.get(r, 0))
+
+    selected_pairs: Set[Tuple[int, int]] = set()
+    for data in corridors.values():
+        pids = list(data.get("patch_ids", []))
+        if len(pids) >= 2:
+            selected_pairs.add(tuple(sorted((int(pids[0]), int(pids[1])))))
+
+    G = None
+    if nx is not None and graph_math is not None:
+        G = nx.Graph()
+        for pid in patch_sizes:
+            G.add_node(int(pid))
+        for data in corridors.values():
+            pids = list(data.get("patch_ids", []))
+            if len(pids) < 2:
+                continue
+            length = float(data.get("length", data.get("area", 1) or 1) or 1)
+            G.add_edge(int(pids[0]), int(pids[1]), weight=length)
+
+    budget_used = 0
+    low_value_added = 0
+    redundancy_added = 0
+
+    while remaining_budget > 0:
+        best_new = None
+        best_red = None
+
+        for cand in candidates:
+            cost = int(cand.get("area", 0) or 0)
+            if cost <= 0 or cost > remaining_budget:
+                continue
+            p1 = cand.get("patch1")
+            p2 = cand.get("patch2")
+            if p1 is None or p2 is None:
+                continue
+            p1i, p2i = int(p1), int(p2)
+            pair = (p1i, p2i) if p1i <= p2i else (p2i, p1i)
+            if pair in selected_pairs:
+                continue
+            r1, r2 = int(uf.find(p1i)), int(uf.find(p2i))
+
+            if r1 != r2:
+                if (r1 == main_root) ^ (r2 == main_root):
+                    gain = int(uf.size.get(r2 if r1 == main_root else r1, 0) or 0)
+                    roi_new = (gain / cost) if cost else 0.0
+                    if roi_new > 0 and (best_new is None or roi_new > best_new[0]):
+                        best_new = (roi_new, cand, gain)
+                continue
+
+            if r1 != main_root:
+                continue
+            length = float(cand.get("length", cost) or cost)
+            score = 0.0
+            if G is not None and graph_math is not None:
+                try:
+                    if nx.has_path(G, p1i, p2i):
+                        score = float(graph_math.score_edge_for_loops(G, p1i, p2i, length))
+                except Exception:
+                    score = 0.0
+            if score <= 0.0:
+                continue
+            roi_red = score / cost if cost else 0.0
+            if roi_red > 0 and (best_red is None or roi_red > best_red[0]):
+                best_red = (roi_red, cand, score)
+
+        if best_new is None and best_red is None:
+            break
+
+        pick_red = False
+        if best_red is not None and best_new is not None:
+            pick_red = best_red[0] > best_new[0] * (1.0 + float(roi_bias))
+        elif best_red is not None:
+            pick_red = True
+
+        roi, cand, _extra = best_red if pick_red else best_new
+        if cand is None or roi <= 0:
+            break
+
+        cost = int(cand.get("area", 0) or 0)
+        if cost <= 0 or cost > remaining_budget:
+            break
+        p1i, p2i = int(cand.get("patch1")), int(cand.get("patch2"))
+        pair = (p1i, p2i) if p1i <= p2i else (p2i, p1i)
+
+        if pick_red:
+            redundancy_added += 1
+            corr_type = "redundant"
+        else:
+            low_value_added += 1
+            corr_type = "low_value"
+
+        r1 = int(uf.find(p1i))
+        r2 = int(uf.find(p2i))
+        if r1 != r2:
+            if r1 == main_root:
+                uf.union(p1i, p2i)
+                main_root = int(uf.find(p1i))
+            elif r2 == main_root:
+                uf.union(p2i, p1i)
+                main_root = int(uf.find(p2i))
+            else:
+                uf.union(p1i, p2i)
+                main_root = int(uf.find(p1i))
+
+        comp_root = int(uf.find(p1i))
+        conn_size = int(uf.size.get(comp_root, 0) or 0)
+        cid = len(corridors) + 1
+        corridors[cid] = {
+            "pixels": cand.get("pixels", set()),
+            "habitat_pixels": cand.get("habitat_pixels", frozenset()),
+            "patch_ids": {p1i, p2i},
+            "area": cost,
+            "connected_size": conn_size,
+            "buffered_pixels": cand.get("buffered_pixels", frozenset()),
+            "length": float(cand.get("length", cost) or cost),
+            "type": corr_type,
+        }
+        selected_pairs.add(pair)
+        remaining_budget -= cost
+        budget_used += cost
+        if G is not None:
+            G.add_edge(p1i, p2i, weight=float(cand.get("length", cost) or cost))
+
+    return budget_used, low_value_added, redundancy_added
+
+
+def _thicken_corridors_raster(
+    corridors: Dict[int, Dict],
+    remaining_budget: int,
+    params: "RasterRunParams",
+    patch_sizes: Dict[int, int],
+    obstacle_mask: Optional[np.ndarray],
+    labels_shape: Tuple[int, int],
+    max_width_factor: int = 3,
+) -> int:
+    """
+    Use remaining budget to thicken corridors up to max_width_factor (in steps of 1x).
+    Prioritize corridors adjacent to the largest patch.
+    """
+    if remaining_budget <= 0 or not corridors or max_width_factor <= 1:
+        return 0
+
+    try:
+        largest_patch = max(patch_sizes.items(), key=lambda kv: kv[1])[0]
+    except Exception:
+        largest_patch = None
+
+    ordered = list(corridors.keys())
+    if largest_patch is not None:
+        ordered = [cid for cid in ordered if largest_patch in corridors[cid].get("patch_ids", set())] + [
+            cid for cid in ordered if largest_patch not in corridors[cid].get("patch_ids", set())
+        ]
+
+    rows, cols = labels_shape
+    budget_used = 0
+
+    for cid in ordered:
+        if remaining_budget <= 0:
+            break
+        cdata = corridors.get(cid) or {}
+        base_pixels = cdata.get("_thicken_base_pixels")
+        if base_pixels is None:
+            base_pixels = frozenset(cdata.get("pixels", set()))
+            cdata["_thicken_base_pixels"] = base_pixels
+        if not base_pixels:
+            continue
+
+        current_buf = cdata.get("buffered_pixels")
+        if current_buf is None:
+            offsets = _corridor_offsets(params.min_corridor_width)
+            current_buf = frozenset(
+                _inflate_corridor_pixels(set(base_pixels), offsets, rows, cols, obstacle_mask=obstacle_mask)
+            )
+            cdata["buffered_pixels"] = current_buf
+
+        current_factor = int(cdata.get("_thicken_factor", 1))
+        for factor in range(current_factor + 1, max_width_factor + 1):
+            width = max(1, int(params.min_corridor_width * factor))
+            offsets = _corridor_offsets(width)
+            new_buf = frozenset(
+                _inflate_corridor_pixels(set(base_pixels), offsets, rows, cols, obstacle_mask=obstacle_mask)
+            )
+            added = len(new_buf) - len(current_buf)
+            if added <= 0:
+                cdata["_thicken_factor"] = factor
+                current_buf = new_buf
+                continue
+            if added > remaining_budget:
+                return budget_used
+            remaining_budget -= added
+            budget_used += added
+            current_buf = new_buf
+            cdata["buffered_pixels"] = current_buf
+            cdata["area"] = len(current_buf)
+            cdata["_thicken_factor"] = factor
+
+    return budget_used
 
 
 def _to_dataclass(params: Dict) -> RasterRunParams:
@@ -2254,106 +2580,150 @@ def _perform_landscape_analysis(
     res_y: float,
     is_metric: bool,
     params: Optional[RasterRunParams] = None,
+    pre_arr: Optional[np.ndarray] = None,
 ) -> List[str]:
     """Calculate landscape metrics for the output raster (contiguous networks)."""
     if not HAS_NDIMAGE or ndimage is None:
         return ["Landscape analysis skipped: scipy.ndimage not found."]
+    results: List[str] = []
 
-    results = []
-    
     if is_metric:
         area_unit, dist_unit = "ha", "km"
         pixel_area_ha = (res_x * res_y) / 10000.0
-        dist_factor = 1000.0 
+        dist_factor = 1000.0
         gyrate_unit = "m"
     else:
         area_unit, dist_unit = "pixels", "pixels"
         pixel_area_ha, dist_factor = 1.0, 1.0
         gyrate_unit = "pixels"
 
-    # In our network output, 0 is background, >0 is part of a contiguous area
-    habitat_mask = arr > 0
-    n_hab_pixels = np.sum(habitat_mask)
-    if n_hab_pixels == 0:
-        return ["Landscape analysis: No contiguous habitat areas found in output."]
+    def _metrics_from_mask(mask: np.ndarray) -> Tuple[Dict[str, float], bool]:
+        hab_pixels = int(np.sum(mask))
+        if hab_pixels <= 0:
+            return {
+                "total_area": 0.0,
+                "num_patches": 0.0,
+                "mesh": 0.0,
+                "lps": 0.0,
+                "split": 0.0,
+                "pd": 0.0,
+                "lpi": 0.0,
+                "total_edge": 0.0,
+                "msi": 0.0,
+                "ed": 0.0,
+                "mean_para": 0.0,
+                "frac": 0.0,
+                "ai": 0.0,
+                "cai": 0.0,
+                "mean_gyrate": 0.0,
+            }, True
 
-    # Use 8-connectivity to match landscape metric standards
-    s = ndimage.generate_binary_structure(2, 2)
-    labeled_array, num_patches = ndimage.label(habitat_mask, structure=s)
-    if num_patches == 0:
-        return ["Landscape analysis: No contiguous patches identified."]
-        
-    patch_ids = np.arange(1, num_patches + 1)
-    patch_pixel_counts = np.bincount(labeled_array.ravel())[1:]
-    
-    # Edge detection kernel
-    kernel = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]])
-    neighbor_count = ndimage.convolve(habitat_mask.astype(float), kernel, mode='constant', cval=0)
-    edge_map = (4.0 - neighbor_count) * habitat_mask
-    
-    patch_areas_ha = patch_pixel_counts * pixel_area_ha
-    patch_perims_m = ndimage.sum(edge_map, labeled_array, index=patch_ids) * (res_x if is_metric else 1.0)
-    patch_areas_m2 = patch_pixel_counts * (res_x * res_y if is_metric else 1.0)
-    total_area_ha = n_hab_pixels * pixel_area_ha
-    total_edge_m = np.sum(edge_map) * (res_x if is_metric else 1.0)
+        s = ndimage.generate_binary_structure(2, 2)
+        labeled_array, num_patches = ndimage.label(mask, structure=s)
 
-    # 1. Patch Density & Area Metrics
-    pd = (num_patches / total_area_ha) * 100 if total_area_ha > 0 else 0
-    mesh = np.sum(patch_areas_ha**2) / total_area_ha if total_area_ha > 0 else 0
-    split = (total_area_ha**2) / np.sum(patch_areas_ha**2) if np.sum(patch_areas_ha**2) > 0 else 0
-    lps_ha = np.max(patch_areas_ha) if num_patches > 0 else 0
-    lpi = (lps_ha / total_area_ha) * 100 if total_area_ha > 0 else 0
-    
-    # 2. Aggregation Index
-    denom_ai = (2 * n_hab_pixels - 2 * int(np.sqrt(n_hab_pixels)) - 2)
-    ai = ((n_hab_pixels * 4 - np.sum(edge_map)) / 2) / denom_ai * 100 if denom_ai > 0 else 0
-    
-    # 3. Shape & Complexity Metrics
-    ed = total_edge_m / total_area_ha if total_area_ha > 0 else 0
-    with np.errstate(divide='ignore', invalid='ignore'):
-        msi = np.mean(0.25 * patch_perims_m / np.sqrt(patch_areas_m2)) if num_patches > 0 else 0
-        mean_para = np.mean(patch_perims_m / patch_areas_m2) if num_patches > 0 else 0
-        frac_vals = (2 * np.log(0.25 * patch_perims_m)) / np.log(patch_areas_m2)
-        frac = np.nanmean(frac_vals) if num_patches > 0 else 0
-    
-    # 4. Core Area Metrics
-    core_mask = ndimage.binary_erosion(habitat_mask)
-    cai = (np.sum(core_mask) / n_hab_pixels) * 100 if n_hab_pixels > 0 else 0
-    
-    # 5. Radius of Gyration
-    gyrations = []
-    for p_id in patch_ids:
-        # Performance safety: limit gyration calculation if there are massive numbers of tiny components
-        if num_patches > 1000 and p_id > 200:
-            break
-        coords = np.argwhere(labeled_array == p_id)
-        if len(coords) < 2: continue
-        gyrations.append(np.sqrt(np.mean(np.sum((coords - coords.mean(axis=0))**2, axis=1))) * (res_x if is_metric else 1.0))
-    mean_gyrate = np.mean(gyrations) if gyrations else 0
+        patch_ids = np.arange(1, num_patches + 1)
+        patch_pixel_counts = np.bincount(labeled_array.ravel())[1:] if num_patches > 0 else np.array([], dtype=float)
 
-    header = "=" * 85
+        kernel = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]])
+        neighbor_count = ndimage.convolve(mask.astype(float), kernel, mode="constant", cval=0)
+        edge_map = (4.0 - neighbor_count) * mask
+
+        patch_areas_ha = patch_pixel_counts * pixel_area_ha
+        patch_perims_m = ndimage.sum(edge_map, labeled_array, index=patch_ids) * (res_x if is_metric else 1.0) if num_patches > 0 else np.array([], dtype=float)
+        patch_areas_m2 = patch_pixel_counts * (res_x * res_y if is_metric else 1.0)
+        total_area_ha = hab_pixels * pixel_area_ha
+        total_edge_m = float(np.sum(edge_map)) * (res_x if is_metric else 1.0)
+
+        pd = (num_patches / total_area_ha) * 100 if total_area_ha > 0 else 0.0
+        mesh = float(np.sum(patch_areas_ha**2) / total_area_ha) if total_area_ha > 0 else 0.0
+        split = float((total_area_ha**2) / np.sum(patch_areas_ha**2)) if np.sum(patch_areas_ha**2) > 0 else 0.0
+        lps_ha = float(np.max(patch_areas_ha)) if num_patches > 0 else 0.0
+        lpi = (lps_ha / total_area_ha) * 100 if total_area_ha > 0 else 0.0
+
+        denom_ai = (2 * hab_pixels - 2 * int(np.sqrt(hab_pixels)) - 2)
+        ai = ((hab_pixels * 4 - np.sum(edge_map)) / 2) / denom_ai * 100 if denom_ai > 0 else 0.0
+
+        ed = total_edge_m / total_area_ha if total_area_ha > 0 else 0.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            msi = float(np.mean(0.25 * patch_perims_m / np.sqrt(patch_areas_m2))) if num_patches > 0 else 0.0
+            mean_para = float(np.mean(patch_perims_m / patch_areas_m2)) if num_patches > 0 else 0.0
+            frac_vals = (2 * np.log(0.25 * patch_perims_m)) / np.log(patch_areas_m2) if num_patches > 0 else np.array([], dtype=float)
+            frac = float(np.nanmean(frac_vals)) if num_patches > 0 and frac_vals.size else 0.0
+
+        core_mask = ndimage.binary_erosion(mask)
+        cai = (float(np.sum(core_mask)) / hab_pixels) * 100 if hab_pixels > 0 else 0.0
+
+        gyrations = []
+        for p_id in patch_ids:
+            if num_patches > 1000 and p_id > 200:
+                break
+            coords = np.argwhere(labeled_array == p_id)
+            if len(coords) < 2:
+                continue
+            gyrations.append(
+                np.sqrt(np.mean(np.sum((coords - coords.mean(axis=0)) ** 2, axis=1))) * (res_x if is_metric else 1.0)
+            )
+        mean_gyrate = float(np.mean(gyrations)) if gyrations else 0.0
+
+        return {
+            "total_area": float(total_area_ha),
+            "num_patches": float(num_patches),
+            "mesh": float(mesh),
+            "lps": float(lps_ha),
+            "split": float(split),
+            "pd": float(pd),
+            "lpi": float(lpi),
+            "total_edge": float(total_edge_m / dist_factor),
+            "msi": float(msi),
+            "ed": float(ed),
+            "mean_para": float(mean_para),
+            "frac": float(frac),
+            "ai": float(ai),
+            "cai": float(cai),
+            "mean_gyrate": float(mean_gyrate),
+        }, False
+
+    pre_mask = (pre_arr if pre_arr is not None else arr) > 0
+    post_mask = arr > 0
+
+    pre_metrics, pre_empty = _metrics_from_mask(pre_mask)
+    post_metrics, post_empty = _metrics_from_mask(post_mask)
+
+    header = "=" * 100
     results.append(header)
     results.append(f" LANDSCAPE ANALYSIS: {layer_name}")
     results.append(header)
-    results.append(f"{'METRIC NAME':<30} | {'VALUE':<15} | {'INTERPRETATION'}")
-    results.append("-" * 85)
-    results.append(f"{'Total Area':<30} | {total_area_ha:<15,.2f} | {area_unit}")
-    results.append(f"{'Num. Patches (NP)':<30} | {num_patches:<15} | count")
-    results.append(f"{'Eff. Mesh Size':<30} | {mesh:<15,.2f} | {area_unit} (Functional size)")
-    results.append(f"{'Largest Patch Size':<30} | {lps_ha:<15,.2f} | {area_unit}")
-    results.append(f"{'Splitting Index':<30} | {split:<15.2f} | 1 = solid, High = broken")
-    results.append(f"{'Patch Density (PD)':<30} | {pd:<15.2f} | Patches per 100 units")
-    results.append(f"{'Largest Patch Index (LPI)':<30} | {lpi:<15.2f} | % of landscape")
-    results.append(f"{'Total Edge':<30} | {total_edge_m/dist_factor:<15.2f} | {dist_unit}")
-    results.append(f"{'Mean Shape Index (MSI)':<30} | {msi:<15.2f} | 1.0 = Square, >1 = Complex")
-    results.append(f"{'Edge Density (ED)':<30} | {ed:<15.2f} | m edge per ha")
-    results.append(f"{'Mean PARA':<30} | {mean_para:<15.5f} | Perimeter-Area Ratio")
-    results.append(f"{'Fractal Dimension':<30} | {frac:<15.2f} | Complexity scale")
-    results.append(f"{'Aggregation Index (AI)':<30} | {ai:<15.2f} | 0 = Dispersed, 100 = Clumped")
-    results.append(f"{'Core Area Index (CAI)':<30} | {cai:<15.2f} | % non-peninsula")
-    results.append(f"{'Mean Radius of Gyration':<30} | {mean_gyrate:<15.2f} | {gyrate_unit} (Internal reach)")
+    if pre_empty:
+        results.append("Note: pre-corridor habitat mask contains no habitat pixels.")
+    if post_empty:
+        results.append("Note: post-corridor habitat mask contains no habitat pixels.")
+    results.append(f"{'METRIC NAME':<30} | {'PRE':<15} | {'POST':<15} | {'INTERPRETATION'}")
+    results.append("-" * 100)
+
+    specs = [
+        ("Total Area", "total_area", "{:,.2f}", area_unit),
+        ("Num. Patches (NP)", "num_patches", "{:,.0f}", "count"),
+        ("Eff. Mesh Size", "mesh", "{:,.2f}", f"{area_unit} (Functional size)"),
+        ("Largest Patch Size", "lps", "{:,.2f}", area_unit),
+        ("Splitting Index", "split", "{:,.2f}", "1 = solid, High = broken"),
+        ("Patch Density (PD)", "pd", "{:,.2f}", "Patches per 100 units"),
+        ("Largest Patch Index (LPI)", "lpi", "{:,.2f}", "% of landscape"),
+        ("Total Edge", "total_edge", "{:,.2f}", dist_unit),
+        ("Mean Shape Index (MSI)", "msi", "{:,.2f}", "1.0 = Square, >1 = Complex"),
+        ("Edge Density (ED)", "ed", "{:,.2f}", f"{dist_unit} edge per {area_unit}"),
+        ("Mean PARA", "mean_para", "{:,.5f}", "Perimeter-Area Ratio"),
+        ("Fractal Dimension", "frac", "{:,.2f}", "Complexity scale"),
+        ("Aggregation Index (AI)", "ai", "{:,.2f}", "0 = Dispersed, 100 = Clumped"),
+        ("Core Area Index (CAI)", "cai", "{:,.2f}", "% non-peninsula"),
+        ("Mean Radius of Gyration", "mean_gyrate", "{:,.2f}", f"{gyrate_unit} (Internal reach)"),
+    ]
+
+    for label, key, fmt, interp in specs:
+        pre_val = fmt.format(pre_metrics.get(key, 0.0))
+        post_val = fmt.format(post_metrics.get(key, 0.0))
+        results.append(f"{label:<30} | {pre_val:<15} | {post_val:<15} | {interp}")
+
     results.append(header)
-    
     return results
 
 
@@ -2570,6 +2940,35 @@ def _run_raster_analysis_core(
     corridors, stats = optimize_func(candidates, patch_sizes, params.budget_pixels)
     if not corridors:
         raise RasterAnalysisError("Selected optimization did not produce any corridors.")
+    remaining_budget = int(max(0, int(params.budget_pixels) - int(stats.get("budget_used", 0) or 0)))
+    if remaining_budget > 0:
+        extra_used, low_value_added, redundancy_added = _apply_hybrid_leftover_budget_raster(
+            candidates=candidates,
+            corridors=corridors,
+            patch_sizes=patch_sizes,
+            remaining_budget=remaining_budget,
+        )
+        if extra_used:
+            stats["budget_used"] = int(stats.get("budget_used", 0) or 0) + int(extra_used)
+            stats["corridors_used"] = len(corridors)
+            if "primary_links" in stats:
+                stats["primary_links"] = int(stats.get("primary_links", 0) or 0) + int(low_value_added)
+            if "redundant_links" in stats:
+                stats["redundant_links"] = int(stats.get("redundant_links", 0) or 0) + int(redundancy_added)
+            _refresh_raster_component_stats(corridors, patch_sizes, stats)
+        remaining_budget = int(max(0, int(params.budget_pixels) - int(stats.get("budget_used", 0) or 0)))
+    if remaining_budget > 0:
+        thickened = _thicken_corridors_raster(
+            corridors=corridors,
+            remaining_budget=remaining_budget,
+            params=params,
+            patch_sizes=patch_sizes,
+            obstacle_mask=obstacle_mask,
+            labels_shape=labels.shape,
+            max_width_factor=3,
+        )
+        if thickened:
+            stats["budget_used"] = int(stats.get("budget_used", 0) or 0) + int(thickened)
     _emit_progress(progress_cb, 85, "Rendering output raster…")
 
     print("  Creating corridor and contiguous network area rasters...")
@@ -2601,12 +3000,12 @@ def _run_raster_analysis_core(
         # Corridor raster (connected_size per corridor cell)
         write_raster(corridor_path, corridor_output, gt, proj, nodata=0)
         print(f"  ✓ Saved corridor raster: {corridor_path}")
+        corr_layer = None
         try:
             corr_layer_name = layer_name.replace("Contiguous Areas", "Corridors")
             corr_layer = QgsRasterLayer(corridor_path, corr_layer_name)
             if corr_layer.isValid():
-                QgsProject.instance().addMapLayer(corr_layer)
-                print("  ✓ Added corridor raster to project")
+                pass
         except Exception:
             pass
 
@@ -2625,6 +3024,7 @@ def _run_raster_analysis_core(
                 abs(gt[5]),
                 is_metric,
                 params=params,
+                pre_arr=patch_mask,
             )
             safe = "".join(ch if ch.isalnum() or ch in ("_", "-", " ") else "_" for ch in (layer.name() or "raster")).strip()
             safe = "_".join(safe.split())[:80] if safe else "run"
@@ -2658,6 +3058,9 @@ def _run_raster_analysis_core(
                 pass
             QgsProject.instance().addMapLayer(net_layer)
             print("  ✓ Added to project")
+        if corr_layer is not None and corr_layer.isValid():
+            QgsProject.instance().addMapLayer(corr_layer)
+            print("  ✓ Added corridor raster to project")
     except Exception as net_exc:  # noqa: BLE001
         print(f"  ⚠ Could not save/add output raster: {net_exc}")
 

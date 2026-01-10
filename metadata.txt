@@ -1,7 +1,7 @@
 [general]
-name=TerraLink 1.1
+name=TerraLink
 qgisMinimumVersion=3.22
-version=1.1.0
+version=1.3
 author=Ben Bishop
 email=benjamin.james.bishop@gmail.com
 description=QGIS plugin for ecological corridor generation and habitat connectivity analysis using raster and vector workflows.
@@ -14,5 +14,5 @@ deprecated=False
 homepage=https://github.com/sorus-tools/Linkscape
 repository=https://github.com/sorus-tools/Linkscape
 tracker=https://github.com/sorus-tools/Linkscape/issues
-changelog=v1.1.0: In development. v1.0.0: Initial TerraLink release (forked from Linkscape 2.0) with refreshed UI, Largest Network + Circuit Theory optimization modes, and cleaner outputs.
+changelog=v1.3: Shortcut efficiency scoring for redundancy, target-importance scaling, pre/post landscape metrics, vector summary CSV/table, leftover-budget thickening + low-value inclusion, and corridors layer order fix. v1.2.0: Prior release. v1.1.0: Prior release. v1.0.0: Initial TerraLink release.
 license=GPL-2.0-or-later

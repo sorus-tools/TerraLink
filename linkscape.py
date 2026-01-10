@@ -15,14 +15,14 @@ class TerraLinkPlugin:
         self.provider = None
 
     def initGui(self):
-        self.action = QAction("Run TerraLink (v1.1)", self.iface.mainWindow())
+        self.action = QAction("Run TerraLink", self.iface.mainWindow())
         icon_path = os.path.join(self.plugin_dir, "icon.png")
         icon = QIcon(icon_path)
         if not icon.isNull():
             self.action.setIcon(icon)
         self.action.triggered.connect(self.run)
         self.iface.addToolBarIcon(self.action)
-        self.iface.addPluginToMenu("&TerraLink (v1.1)", self.action)
+        self.iface.addPluginToMenu("&TerraLink", self.action)
 
         if self.provider is None:
             self.provider = TerraLinkProcessingProvider(self)
@@ -31,7 +31,7 @@ class TerraLinkPlugin:
     def unload(self):
         if self.action is not None:
             self.iface.removeToolBarIcon(self.action)
-            self.iface.removePluginMenu("&TerraLink (v1.1)", self.action)
+            self.iface.removePluginMenu("&TerraLink", self.action)
         if self.provider is not None:
             QgsApplication.processingRegistry().removeProvider(self.provider)
             self.provider = None
