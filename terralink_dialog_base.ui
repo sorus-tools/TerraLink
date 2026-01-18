@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='UTF-8'?>
 <ui version="4.0">
- <class>LinkscapeDialogBase</class>
- <widget class="QDialog" name="LinkscapeDialogBase">
+ <class>TerraLinkDialogBase</class>
+ <widget class="QDialog" name="TerraLinkDialogBase">
   <property name="geometry">
    <rect>
     <x>0</x>
@@ -158,13 +158,6 @@
       <string>Obstacle Definition (Raster)</string>
      </property>
      <layout class="QGridLayout" name="gridLayout_obstacle">
-      <item row="0" column="0" colspan="2">
-       <widget class="QCheckBox" name="obstacle_enable_checkbox">
-        <property name="text">
-         <string>Enable obstacles (corridors cannot cross)</string>
-        </property>
-       </widget>
-      </item>
       <item row="1" column="0">
        <widget class="QLabel" name="label_obstacle_value">
         <property name="text">
@@ -218,12 +211,12 @@
       <widget class="QComboBox" name="strategy_combo">
        <item>
         <property name="text">
-         <string>Largest Network</string>
+         <string>Largest Single Network</string>
         </property>
        </item>
        <item>
        <property name="text">
-        <string>Largest Network</string>
+        <string>Largest Single Network</string>
        </property>
       </item>
       </widget>
@@ -245,6 +238,32 @@
        </widget>
       </item>
       <item row="0" column="1"><widget class="QComboBox" name="pixel_neighborhood_combo"><item><property name="text"><string>4</string></property></item><item><property name="text"><string>8</string></property></item><property name="currentIndex"><number>1</number></property></widget></item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="label_raster_units">
+        <property name="text">
+         <string>Units:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QComboBox" name="raster_units_combo">
+        <item>
+         <property name="text">
+          <string>Pixels (px)</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>Metric (ha/m)</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>Imperial (ac/ft)</string>
+         </property>
+        </item>
+       </widget>
+      </item>
       <item row="3" column="0">
        <widget class="QLabel" name="label_8">
         <property name="text">
@@ -260,27 +279,7 @@
         <property name="toolTip">
          <string>Total corridor pixels allowed.</string>
         </property>
-       <property name="value"><number>50</number></property></widget>
-      </item>
-      <item row="4" column="0">
-       <widget class="QLabel" name="label_max_corridor_area">
-        <property name="text">
-         <string>Max corridor area (px):</string>
-        </property>
-       </widget>
-      </item>
-      <item row="4" column="1">
-       <widget class="QSpinBox" name="max_corridor_area_spin">
-        <property name="maximum">
-         <number>1000000</number>
-        </property>
-        <property name="specialValueText">
-         <string>No limit</string>
-        </property>
-        <property name="toolTip">
-         <string>Optional cap on corridor pixels.</string>
-        </property>
-       <property name="value"><number>0</number></property></widget>
+       <property name="value"><number>20</number></property></widget>
       </item>
       <item row="5" column="0">
        <widget class="QLabel" name="label_9">
@@ -297,7 +296,7 @@
         <property name="toolTip">
          <string>How far to look for patch connections.</string>
         </property>
-       <property name="value"><number>50</number></property></widget>
+       <property name="value"><number>300</number></property></widget>
       </item>
       <item row="6" column="0">
        <widget class="QLabel" name="label_10">
@@ -353,7 +352,7 @@
       <item row="0" column="1">
        <widget class="QLineEdit" name="vector_output_name_line">
         <property name="text">
-         <string>linkscape_corridors.gpkg</string>
+         <string>terralink_corridors.gpkg</string>
         </property>
        </widget>
       </item>
@@ -376,26 +375,6 @@
          <double>100000.000000000000000</double>
         </property>
         <property name="value"><number>200</number></property></widget>
-      </item>
-      <item row="2" column="0">
-       <widget class="QLabel" name="label_vector_max_area">
-        <property name="text">
-         <string>Max Corridor Area (ha):</string>
-        </property>
-       </widget>
-      </item>
-      <item row="2" column="1">
-       <widget class="QDoubleSpinBox" name="vector_max_corridor_area_spin">
-        <property name="decimals">
-         <number>2</number>
-        </property>
-        <property name="maximum">
-         <double>1000000.000000000000000</double>
-        </property>
-        <property name="specialValueText">
-         <string>No limit</string>
-        </property>
-        <property name="value"><number>0</number></property></widget>
       </item>
       <item row="3" column="0">
        <widget class="QLabel" name="label_vector_min_patch">
@@ -491,13 +470,6 @@
      <string>Vector Obstacle Avoidance</string>
     </property>
     <layout class="QGridLayout" name="gridLayout_vector_obstacles">
-     <item row="0" column="0" colspan="2">
-      <widget class="QCheckBox" name="vector_obstacle_enable_checkbox">
-       <property name="text">
-        <string>Enable obstacle avoidance</string>
-       </property>
-      </widget>
-     </item>
      <item row="1" column="0">
      <widget class="QLabel" name="label_vector_obstacle_layer">
        <property name="text">
@@ -558,7 +530,7 @@
   <connection>
    <sender>button_box</sender>
    <signal>accepted()</signal>
-   <receiver>LinkscapeDialogBase</receiver>
+   <receiver>TerraLinkDialogBase</receiver>
    <slot>accept()</slot>
    <hints>
     <hint type="sourcelabel">
@@ -574,7 +546,7 @@
   <connection>
    <sender>button_box</sender>
    <signal>rejected()</signal>
-   <receiver>LinkscapeDialogBase</receiver>
+   <receiver>TerraLinkDialogBase</receiver>
    <slot>reject()</slot>
    <hints>
     <hint type="sourcelabel">

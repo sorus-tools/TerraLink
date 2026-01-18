@@ -2,7 +2,7 @@ import os
 from html import escape
 
 import re
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from qgis.PyQt import uic
 from qgis.PyQt.QtCore import Qt, QTimer, QCoreApplication
@@ -33,17 +33,17 @@ from qgis.PyQt.QtWidgets import (
     QToolButton,
     QStackedWidget,
 )
-from qgis.core import QgsApplication, Qgis, QgsProject, QgsRasterLayer, QgsVectorLayer, QgsWkbTypes
+from qgis.core import QgsApplication, Qgis, QgsProject, QgsRasterLayer, QgsVectorLayer, QgsWkbTypes, QgsUnitTypes
 from qgis.gui import QgsCollapsibleGroupBox
 
 
 FORM_CLASS, _ = uic.loadUiType(os.path.join(
-    os.path.dirname(__file__), 'linkscape_dialog_base.ui'))
+    os.path.dirname(__file__), 'terralink_dialog_base.ui'))
 
 
-class LinkscapeDialog(QDialog, FORM_CLASS):
+class TerraLinkDialog(QDialog, FORM_CLASS):
     def __init__(self, iface, parent=None):
-        super(LinkscapeDialog, self).__init__(parent)
+        super(TerraLinkDialog, self).__init__(parent)
         self.setupUi(self)
         self.iface = iface
         self._help_browser: Optional[QTextBrowser] = None
@@ -239,6 +239,13 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         input_layout.addRow("Layer type:", self.layer_type_combo)
         input_layout.addRow("Input layer:", self.input_layer_combo)
 
+        # Units are a top-level choice for raster analysis.
+        self._raster_units_row = QWidget()
+        raster_units_layout = QFormLayout(self._raster_units_row)
+        raster_units_layout.setContentsMargins(0, 0, 0, 0)
+        raster_units_layout.addRow(self.label_raster_units, self.raster_units_combo)
+        input_layout.addRow(self._raster_units_row)
+
         # Units are a top-level choice for vector analysis.
         self._vector_units_row = QWidget()
         vector_units_layout = QFormLayout(self._vector_units_row)
@@ -257,8 +264,8 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         self._raster_patch_row = QWidget()
         raster_patch_layout = QFormLayout(self._raster_patch_row)
         raster_patch_layout.setContentsMargins(0, 0, 0, 0)
-        raster_patch_layout.addRow("Patch values:", self.patch_value_line)
-        raster_patch_layout.addRow("Min patch size (px):", self.min_patch_size_spin)
+        raster_patch_layout.addRow(self.label_patch_value, self.patch_value_line)
+        raster_patch_layout.addRow(self.label_7, self.min_patch_size_spin)
         input_layout.addRow(self._raster_patch_row)
 
         self._vector_patch_row = QWidget()
@@ -292,9 +299,9 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         self._raster_constraints_row = QWidget()
         raster_constraints_layout = QFormLayout(self._raster_constraints_row)
         raster_constraints_layout.setContentsMargins(0, 0, 0, 0)
-        raster_constraints_layout.addRow("Budget (px):", self.budget_spin)
-        raster_constraints_layout.addRow("Min corridor width (px):", self.min_corridor_width_spin)
-        raster_constraints_layout.addRow("Max search distance (px):", self.max_search_spin)
+        raster_constraints_layout.addRow(self.label_8, self.budget_spin)
+        raster_constraints_layout.addRow(self.label_10, self.min_corridor_width_spin)
+        raster_constraints_layout.addRow(self.label_9, self.max_search_spin)
         constraints_layout.addWidget(self._raster_constraints_row)
 
         self._vector_constraints_row = QWidget()
@@ -315,8 +322,6 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         self._raster_obstacles_row = QWidget()
         raster_obs_layout = QVBoxLayout(self._raster_obstacles_row)
         raster_obs_layout.setContentsMargins(0, 0, 0, 0)
-        self.obstacle_enable_checkbox.setText("Enable impassable land classes")
-        raster_obs_layout.addWidget(self.obstacle_enable_checkbox)
         raster_obs_form = QFormLayout()
         raster_obs_form.setContentsMargins(0, 0, 0, 0)
         self.label_obstacle_value.setText("Impassable values:")
@@ -326,8 +331,6 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         self._vector_obstacles_row = QWidget()
         vector_obs_layout = QVBoxLayout(self._vector_obstacles_row)
         vector_obs_layout.setContentsMargins(0, 0, 0, 0)
-        self.vector_obstacle_enable_checkbox.setText("Enable impassable land classes")
-        vector_obs_layout.addWidget(self.vector_obstacle_enable_checkbox)
         vector_obs_form = QFormLayout()
         vector_obs_form.setContentsMargins(0, 0, 0, 0)
         self.vector_obstacle_layer_list.setVisible(False)
@@ -401,9 +404,9 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             return
         key = self.strategy_combo.currentData() or self.strategy_combo.currentText()
         text = ""
-        if key in ("largest_network", "Largest Network"):
+        if key in ("largest_network", "Largest Single Network"):
             text = "Prioritize one dominant connected network under budget."
-        elif key in ("circuit_utility", "Circuit Theory"):
+        elif key in ("circuit_utility", "Most Connectivity"):
             text = "Maximize system-wide utility (ROI) under budget; can favor robust redundant links."
         self.strategy_help_label.setText(text)
 
@@ -483,6 +486,35 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         except Exception:
             pass
 
+    def _format_run_error(self, err_text: str) -> List[str]:
+        text = (err_text or "").strip()
+        if not text:
+            return ["Run stopped.", "No outputs were generated.", "Reason: Unknown error."]
+        if "Corridor search too large" in text:
+            lines = [
+                "Run stopped: corridor search too large for Circuit Utility.",
+                "No outputs were generated.",
+            ]
+            details = ""
+            suggestions = ""
+            if ")" in text:
+                prefix, _, rest = text.partition(")")
+                if "(" in prefix:
+                    details = prefix.split("(", 1)[1].strip()
+                suggestions = rest.strip()
+                if suggestions.startswith("."):
+                    suggestions = suggestions[1:].strip()
+            if details:
+                detail_chunks = [chunk.strip() for chunk in details.split(";") if chunk.strip()]
+                if detail_chunks:
+                    lines.append(f"Details: {detail_chunks[0]}.")
+                if len(detail_chunks) > 1:
+                    lines.append(f"Params: {detail_chunks[1].rstrip('.')}.")
+            if suggestions:
+                lines.append(suggestions)
+            return lines
+        return ["Run stopped.", "No outputs were generated.", f"Reason: {text}"]
+
     def _progress_log(self, value: int, message: Optional[str] = None) -> None:
         try:
             pct = int(max(0, min(100, value)))
@@ -527,47 +559,60 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         self.input_layer_combo.currentIndexChanged.connect(self._on_layer_changed)
         self.layer_type_combo.currentTextChanged.connect(self._on_layer_type_changed)
         self.temporary_output_checkbox.toggled.connect(self._on_temporary_toggled)
+        self.raster_units_combo.currentTextChanged.connect(self._update_raster_units_labels)
         self.vector_units_combo.currentTextChanged.connect(self._update_vector_units_labels)
         self.strategy_combo.currentIndexChanged.connect(self._on_strategy_changed)
-        self.obstacle_enable_checkbox.toggled.connect(self._update_obstacle_controls)
-        self.vector_obstacle_enable_checkbox.toggled.connect(self._update_vector_obstacle_controls)
 
     def _populate_strategy_combo(self) -> None:
         self.strategy_combo.clear()
         self.strategy_combo.addItems(
             [
-                "Largest Network",
-                "Circuit Theory",
+                "Largest Single Network",
+                "Most Connectivity",
             ]
         )
         self.strategy_combo.setItemData(0, "largest_network")
         self.strategy_combo.setItemData(1, "circuit_utility")
-        # Default to Circuit Theory for new runs.
+        # Default to Most Connectivity for new runs.
         try:
             self.strategy_combo.setCurrentIndex(1)
         except Exception:
             pass
 
     def _configure_defaults(self):
+        self._raster_unit_system = "pixels"
         self._vector_unit_system = "metric"
         self._populate_strategy_combo()
         self.temporary_output_checkbox.setChecked(True)
+        self.raster_units_combo.setItemData(0, "pixels")
+        self.raster_units_combo.setItemData(1, "metric")
+        self.raster_units_combo.setItemData(2, "imperial")
         self.vector_units_combo.setItemData(0, "metric")
         self.vector_units_combo.setItemData(1, "imperial")
         idx = self.pixel_neighborhood_combo.findText("8")
         if idx >= 0:
             self.pixel_neighborhood_combo.setCurrentIndex(idx)
         self._on_temporary_toggled(self.temporary_output_checkbox.isChecked())
+        self._update_raster_units_labels(self.raster_units_combo.currentText())
         self._update_vector_units_labels(self.vector_units_combo.currentText())
-        self._update_obstacle_controls(self.obstacle_enable_checkbox.isChecked())
-        self._update_vector_obstacle_controls(self.vector_obstacle_enable_checkbox.isChecked())
+        try:
+            self.label_obstacle_value.setEnabled(True)
+            self.obstacle_value_line.setEnabled(True)
+        except Exception:
+            pass
+        try:
+            self.label_vector_obstacle_layer.setEnabled(True)
+            self.label_vector_obstacle_resolution.setEnabled(True)
+            self.vector_obstacle_resolution_spin.setEnabled(True)
+        except Exception:
+            pass
 
         # Optional-by-default controls: show blank at 0 and treat it as "unset".
         try:
             self.min_patch_size_spin.setMinimum(0)
             self.min_patch_size_spin.setSpecialValueText("")
-            # Raster defaults: 30 px minimum patch size.
-            self.min_patch_size_spin.setValue(30)
+            # Raster defaults: 100 px minimum patch size.
+            self.min_patch_size_spin.setValue(100)
         except Exception:
             pass
         try:
@@ -577,8 +622,18 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         except Exception:
             pass
         try:
-            # Raster defaults: 10 px budget.
-            self.budget_spin.setValue(10)
+            # Raster defaults: 20 px budget.
+            self.budget_spin.setValue(20)
+        except Exception:
+            pass
+        try:
+            # Raster defaults: 3 px minimum corridor width.
+            self.min_corridor_width_spin.setValue(3)
+        except Exception:
+            pass
+        try:
+            # Raster defaults: 300 px search distance.
+            self.max_search_spin.setValue(300)
         except Exception:
             pass
         try:
@@ -596,7 +651,7 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
         """Load markdown help content into the right-hand panel."""
         if self._help_browser is None:
             return
-        help_path = os.path.join(os.path.dirname(__file__), "linkscape_help.md")
+        help_path = os.path.join(os.path.dirname(__file__), "terralink_help.md")
         if not os.path.exists(help_path):
             self._help_browser.setPlainText("TerraLink\n\nHelp file not found.")
             return
@@ -689,6 +744,7 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
 
         lst.blockSignals(False)
         self._update_vector_obstacle_selector_text()
+        self._update_vector_obstacle_controls(True)
 
     def _selected_vector_obstacle_layer_ids(self) -> List[str]:
         ids: List[str] = []
@@ -813,39 +869,10 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
                 self.output_dir_line.setText(os.path.dirname(layer.source()))
             if (
                 self._current_layer_type == "vector"
-                and self.vector_output_name_line.text().strip() in ("", "optimized_corridors.gpkg", "linkscape_corridors.gpkg")
+                and self.vector_output_name_line.text().strip() in ("", "optimized_corridors.gpkg", "terralink_corridors.gpkg")
             ):
-                base_name = f"{layer.name()}_linkscape.gpkg"
+                base_name = f"{layer.name()}_terralink.gpkg"
                 self.vector_output_name_line.setText(base_name)
-
-            # Auto-fill max search distance when selecting a layer.
-            try:
-                def _round_nearest(value: float, step: float) -> float:
-                    if step <= 0:
-                        return value
-                    return round(value / step) * step
-
-                scaling_factor = 0.25
-                if self._current_layer_type == "vector" and isinstance(layer, QgsVectorLayer) and layer.isValid():
-                    extent = layer.extent()
-                    max_dim = max(extent.width(), extent.height())
-                    if max_dim > 0:
-                        value = max_dim * scaling_factor
-                        if self.vector_units_combo.currentData() == "imperial":
-                            value *= 3.280839895  # meters to feet
-                        self.vector_max_search_spin.blockSignals(True)
-                        self.vector_max_search_spin.setValue(_round_nearest(float(value), 5.0))
-                        self.vector_max_search_spin.blockSignals(False)
-                elif self._current_layer_type == "raster" and isinstance(layer, QgsRasterLayer) and layer.isValid():
-                    max_dim_px = max(int(layer.width()), int(layer.height()))
-                    if max_dim_px > 0:
-                        value_px = int(_round_nearest(float(max_dim_px * scaling_factor), 5.0))
-                        self.max_search_spin.blockSignals(True)
-                        self.max_search_spin.setValue(max(0, value_px))
-                        self.max_search_spin.blockSignals(False)
-            except Exception:
-                pass
-
             self._update_vector_obstacle_selector_text()
 
     def _on_temporary_toggled(self, checked: bool):
@@ -877,10 +904,6 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
                 self.vector_budget_spin.setValue(
                     round(self.vector_budget_spin.value() * 2.471053814, 4)
                 )
-                if self.vector_max_corridor_area_spin.value() != 0.0:
-                    self.vector_max_corridor_area_spin.setValue(
-                        round(self.vector_max_corridor_area_spin.value() * 2.471053814, 4)
-                    )
             else:
                 # Convert imperial to metric
                 self.vector_min_corridor_width_spin.setValue(
@@ -895,10 +918,6 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
                 self.vector_budget_spin.setValue(
                     round(self.vector_budget_spin.value() * 0.404685642, 4)
                 )
-                if self.vector_max_corridor_area_spin.value() != 0.0:
-                    self.vector_max_corridor_area_spin.setValue(
-                        round(self.vector_max_corridor_area_spin.value() * 0.404685642, 4)
-                    )
             self._vector_unit_system = new_units
 
         if self.vector_units_combo.currentData() == "imperial":
@@ -913,6 +932,107 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             self.label_vector_min_patch.setText("Min Patch Size (ha):")
             self.label_vector_budget.setText("Budget (ha):")
             self.label_vector_max_area.setText("Max Corridor Area (ha):")
+
+    def _map_units_to_meters(self, units: int) -> Optional[float]:
+        if units == QgsUnitTypes.DistanceMeters:
+            return 1.0
+        if units == QgsUnitTypes.DistanceFeet:
+            return 0.3048
+        if units == QgsUnitTypes.DistanceFeetUS:
+            return 0.3048006096
+        return None
+
+    def _raster_pixel_size_m(self) -> Optional[Tuple[float, float]]:
+        layer = self._layer_from_index(self.input_layer_combo.currentIndex())
+        if layer is None or not isinstance(layer, QgsRasterLayer) or not layer.isValid():
+            return None
+        try:
+            res_x = abs(float(layer.rasterUnitsPerPixelX()))
+            res_y = abs(float(layer.rasterUnitsPerPixelY()))
+        except Exception:
+            return None
+        if res_x <= 0 or res_y <= 0:
+            return None
+        units_to_m = self._map_units_to_meters(layer.crs().mapUnits())
+        if units_to_m is None:
+            return None
+        return res_x * units_to_m, res_y * units_to_m
+
+    def _update_raster_units_labels(self, _: str):
+        new_units = self.raster_units_combo.currentData() or "pixels"
+        if not hasattr(self, "_raster_unit_system"):
+            self._raster_unit_system = "pixels"
+
+        if new_units != self._raster_unit_system:
+            pixel_sizes = self._raster_pixel_size_m()
+            if pixel_sizes is None:
+                self._append_log(
+                    "Raster unit conversion requires a projected CRS (meters/feet). "
+                    "Values left unchanged; reproject or switch to Pixels.",
+                    "WARNING",
+                )
+            else:
+                res_x_m, res_y_m = pixel_sizes
+                pixel_area_m2 = res_x_m * res_y_m
+                pixel_size_m = max(res_x_m, res_y_m)
+
+                def area_to_pixels(value: float, units: str) -> float:
+                    if units == "pixels":
+                        return value
+                    if units == "metric":
+                        return value * 10000.0 / pixel_area_m2
+                    return value * 4046.8564224 / pixel_area_m2
+
+                def area_from_pixels(value: float, units: str) -> float:
+                    if units == "pixels":
+                        return value
+                    if units == "metric":
+                        return value * pixel_area_m2 / 10000.0
+                    return value * pixel_area_m2 / 4046.8564224
+
+                def dist_to_pixels(value: float, units: str) -> float:
+                    if units == "pixels":
+                        return value
+                    if units == "metric":
+                        return value / pixel_size_m
+                    return (value * 0.3048) / pixel_size_m
+
+                def dist_from_pixels(value: float, units: str) -> float:
+                    if units == "pixels":
+                        return value
+                    if units == "metric":
+                        return value * pixel_size_m
+                    return value * pixel_size_m / 0.3048
+
+                old_units = self._raster_unit_system
+                min_patch_px = area_to_pixels(float(self.min_patch_size_spin.value()), old_units)
+                budget_px = area_to_pixels(float(self.budget_spin.value()), old_units)
+                min_width_px = dist_to_pixels(float(self.min_corridor_width_spin.value()), old_units)
+                max_search_px = dist_to_pixels(float(self.max_search_spin.value()), old_units)
+
+                self.min_patch_size_spin.setValue(int(round(max(0.0, area_from_pixels(min_patch_px, new_units)))))
+                self.budget_spin.setValue(int(round(max(0.0, area_from_pixels(budget_px, new_units)))))
+                self.min_corridor_width_spin.setValue(
+                    int(round(max(1.0, dist_from_pixels(min_width_px, new_units))))
+                )
+                self.max_search_spin.setValue(int(round(max(0.0, dist_from_pixels(max_search_px, new_units)))))
+
+        self._raster_unit_system = new_units
+        if new_units == "imperial":
+            self.label_7.setText("Min patch size (ac):")
+            self.label_8.setText("Budget (ac):")
+            self.label_10.setText("Min corridor width (ft):")
+            self.label_9.setText("Max search distance (ft):")
+        elif new_units == "metric":
+            self.label_7.setText("Min patch size (ha):")
+            self.label_8.setText("Budget (ha):")
+            self.label_10.setText("Min corridor width (m):")
+            self.label_9.setText("Max search distance (m):")
+        else:
+            self.label_7.setText("Min patch size (px):")
+            self.label_8.setText("Budget (px):")
+            self.label_10.setText("Min corridor width (px):")
+            self.label_9.setText("Max search distance (px):")
 
     def _on_strategy_changed(self, _index: int):
         self._update_strategy_help()
@@ -953,6 +1073,8 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             self._raster_patch_row.setVisible(is_raster)
         if hasattr(self, "_vector_patch_row"):
             self._vector_patch_row.setVisible(not is_raster)
+        if hasattr(self, "_raster_units_row"):
+            self._raster_units_row.setVisible(is_raster)
         if hasattr(self, "_vector_units_row"):
             self._vector_units_row.setVisible(not is_raster)
         if hasattr(self, "_raster_neighborhood_row"):
@@ -1035,6 +1157,38 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
 
     def _collect_raster_parameters(self) -> Dict:
         connectivity = int(self.pixel_neighborhood_combo.currentText())
+        units = self.raster_units_combo.currentData() or "pixels"
+        min_patch_value = float(self.min_patch_size_spin.value())
+        budget_value = float(self.budget_spin.value())
+        min_width_value = float(self.min_corridor_width_spin.value())
+        max_search_value = float(self.max_search_spin.value())
+
+        if units == "pixels":
+            min_patch_px = int(round(min_patch_value))
+            budget_px = int(round(budget_value))
+            min_width_px = int(round(min_width_value))
+            max_search_px = int(round(max_search_value))
+        else:
+            pixel_sizes = self._raster_pixel_size_m()
+            if pixel_sizes is None:
+                raise ValueError(
+                    "Raster CRS must be projected (meters/feet) to use ha/ac units. "
+                    "Reproject the raster or switch to Pixels."
+                )
+            res_x_m, res_y_m = pixel_sizes
+            pixel_area_m2 = res_x_m * res_y_m
+            pixel_size_m = max(res_x_m, res_y_m)
+            if units == "metric":
+                area_factor = 10000.0
+                dist_factor = 1.0
+            else:
+                area_factor = 4046.8564224
+                dist_factor = 0.3048
+            min_patch_px = int(round((min_patch_value * area_factor) / pixel_area_m2))
+            budget_px = int(round((budget_value * area_factor) / pixel_area_m2))
+            min_width_px = int(round((min_width_value * dist_factor) / pixel_size_m))
+            max_search_px = int(round((max_search_value * dist_factor) / pixel_size_m))
+
         params = {
             "patch_connectivity": connectivity,
             "patch_mode": "value",
@@ -1043,13 +1197,13 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             "range_upper": None,
             "value_tolerance": 1e-6,
             "nodata_fallback": -9999.0,
-            "min_patch_size": self.min_patch_size_spin.value(),
+            "min_patch_size": max(0, min_patch_px),
             "allow_sub_min_corridor": True,
-            "budget_pixels": self.budget_spin.value(),
-            "max_search_distance": self.max_search_spin.value(),
-            "min_corridor_width": self.min_corridor_width_spin.value(),
+            "budget_pixels": max(0, budget_px),
+            "max_search_distance": max(0, max_search_px),
+            "min_corridor_width": max(1, min_width_px),
             "allow_bottlenecks": self.allow_bottlenecks_checkbox.isChecked(),
-            "obstacle_enabled": self.obstacle_enable_checkbox.isChecked(),
+            "obstacle_enabled": False,
             "obstacle_mode": "value",
             "obstacle_values": [],
             "obstacle_range_lower": None,
@@ -1061,23 +1215,21 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             raise ValueError("Enter at least one patch value.")
         params["patch_values"] = values
 
-        if params["obstacle_enabled"]:
-            obstacle_values = self._parse_values(self.obstacle_value_line.text())
-            if not obstacle_values:
-                raise ValueError("Enter at least one impassable value.")
+        obstacle_values = self._parse_values(self.obstacle_value_line.text())
+        if obstacle_values:
+            params["obstacle_enabled"] = True
             params["obstacle_values"] = obstacle_values
 
         return params
 
     def _collect_vector_parameters(self) -> Dict:
-        output_name = self.vector_output_name_line.text().strip() or "linkscape_corridors.gpkg"
+        output_name = self.vector_output_name_line.text().strip() or "terralink_corridors.gpkg"
         units = self.vector_units_combo.currentData() or "metric"
 
         width_value = self.vector_min_corridor_width_spin.value()
         search_value = self.vector_max_search_spin.value()
         min_patch_value = self.vector_min_patch_size_spin.value()
         budget_value = self.vector_budget_spin.value()
-        obstacle_enabled = self.vector_obstacle_enable_checkbox.isChecked()
         resolution_value = self.vector_obstacle_resolution_spin.value()
         obstacle_layer_ids: List[str] = []
         for i in range(self.vector_obstacle_layer_list.count()):
@@ -1098,9 +1250,7 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             resolution_value *= 0.3048
         # Max corridor area removed from UI; no explicit limit is passed.
 
-        if obstacle_enabled and not obstacle_layer_ids:
-            raise ValueError("Select at least one impassable layer to enable impassable land classes.")
-
+        obstacle_enabled = bool(obstacle_layer_ids)
         return {
             "min_corridor_width": width_value,
             "min_patch_size": min_patch_value,
@@ -1108,8 +1258,8 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             "max_search_distance": search_value,
             "output_name": output_name,
             "unit_system": units,
-            "obstacle_enabled": obstacle_enabled and bool(obstacle_layer_ids),
-            "obstacle_layer_ids": obstacle_layer_ids if obstacle_enabled else [],
+            "obstacle_enabled": obstacle_enabled,
+            "obstacle_layer_ids": obstacle_layer_ids,
             "obstacle_layer_id": obstacle_layer_ids[0] if obstacle_layer_ids else None,
             "grid_resolution": resolution_value,
         }
@@ -1199,7 +1349,7 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
             if not output_dir:
                 import tempfile
 
-                output_dir = tempfile.mkdtemp(prefix="linkscape_temp_")
+                output_dir = tempfile.mkdtemp(prefix="terralink_temp_")
                 self._append_log(f"Created temporary output directory: {output_dir}", "INFO")
         else:
             try:
@@ -1277,7 +1427,15 @@ class LinkscapeDialog(QDialog, FORM_CLASS):
                 )
 
         except Exception as exc:  # noqa: BLE001
-            self._append_log(f"Run failed: {exc}", "CRITICAL")
+            for line in self._format_run_error(str(exc)):
+                self._append_log(line, "CRITICAL")
+            try:
+                if self._progress_bar is not None:
+                    self._progress_bar.setValue(0)
+                if self._progress_status_label is not None:
+                    self._progress_status_label.setText("Run stopped (see Log)")
+            except Exception:
+                pass
             self._run_in_progress = False
             try:
                 if ok_btn is not None:

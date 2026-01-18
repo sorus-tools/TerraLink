@@ -1,4 +1,4 @@
-# TerraLink QGIS Plugin 1.3
+# TerraLink QGIS Plugin 1.4
 
 **Ecological Corridor Optimization for Habitat Connectivity**
 
@@ -9,16 +9,19 @@ Image: Corridors generated (pink) to strategically connect the maximum landscape
 
 ---
 
-## What’s New in 1.3
+## What’s New in 1.4
 
-- **Pre/Post landscape metrics**
-  - Landscape metrics tables now include PRE and POST values for connectivity impact.
-- **Leftover budget behavior**
-  - Remaining budget can add low-value links, then thicken corridors up to 3x width.
-- **Vector summary outputs**
-  - Vector runs now write a summary CSV and load it as a table layer in QGIS.
-- **Output layer order**
-  - Corridors are added above contiguous areas in QGIS for both raster and vector runs.
+- **Cleaner, more predictable interface behavior**
+  - Settings and controls are organized more clearly in one place.
+  - Invalid or conflicting options are easier to catch, with clearer feedback about what will actually run.
+  - Fewer odd results caused by unnoticed settings.
+- **More robust and consistent vector analysis**
+  - Vector workflow is now the main reference implementation.
+  - Rules for terminal selection, spacing, and strategy behavior are clearer and more consistent.
+  - Small sample sizes, odd-shaped areas, and edge effects are handled intentionally.
+- **Raster analysis now behaves more like the vector version**
+  - Raster workflows follow the same logic and assumptions as vector workflows.
+  - The tool is clearer about when analysis starts/stops and how failures are handled.
 
 ## Table of Contents
 
@@ -43,7 +46,7 @@ TerraLink analyzes habitat patches (either raster cells or vector polygons) and 
 
 - Available budget in pixels or area units  
 - Spatial constraints like maximum search distance and minimum corridor width  
-- Optimization mode (Largest Network vs Circuit Theory)  
+- Optimization mode (Largest Single Network vs Most Connectivity)  
 
 The plugin supports both raster and vector workflows so you can work directly with LULC data or polygon habitat maps.
 
@@ -58,15 +61,15 @@ The plugin supports both raster and vector workflows so you can work directly wi
   - Filter out tiny patches below a minimum size before corridor planning  
 
 - **Optimization modes**  
-  - Largest Network  
-  - Circuit Theory  
+  - Largest Single Network  
+  - Most Connectivity  
 
 - **Impassable Land Classes**  
   - Raster: treat one or more values or ranges as impassable land classes and control whether corridors can squeeze through narrow gaps.  
   - Vector: optionally build a raster grid over one or more impassable polygon layers for pathfinding around barriers (roads, rivers, urban footprints).  
 
 - **Budget-constrained analysis**  
-  - Limit total corridor construction cost in pixels (raster) or hectares/acres (vector). Terralink will choose the optimal configuration of the corridors. 
+  - Limit total corridor construction cost in pixels (raster) or hectares/acres (vector). TerraLink will choose the optimal configuration of the corridors. 
 
 - **Unit flexibility (vector)**  
   - Choose metric or imperial units for corridor width, distances, and budgets.  
@@ -109,13 +112,14 @@ You can also launch it from the Processing Toolbox under `TerraLink → TerraLin
    - Pick `Raster` or `Vector` in the layer type selector if the plugin does not infer it correctly.  
 
 4. **Pick an optimization mode**  
-   - Use Largest Network to prioritize one dominant connected network.  
-   - Use Circuit Theory to prioritize highest ROI corridors and meaningful redundancies.  
+   - Use Largest Single Network to prioritize one dominant connected network.  
+   - Use Most Connectivity to prioritize highest ROI corridors and meaningful redundancies.  
 
 5. **Set basic parameters**  
    - Minimum patch size (filters tiny patches out of the habitat pool).  
    - Minimum corridor width.  
    - Budget and maximum search distance.  
+   - Raster units: Pixels, Metric (ha/m), or Imperial (ac/ft). Metric/Imperial requires a projected CRS.  
 
 6. **Set impassable land classes (optional)**  
    - Raster: choose impassable values or ranges, and decide if corridors may pass through small gaps (bottlenecks).  
@@ -137,6 +141,7 @@ Raster mode is designed for land cover or habitat grids, where each cell can be 
 - **Patch connectivity**: choose 4- or 8-neighbor connectivity when identifying contiguous patches.  
 - **Patch values**: specify one or more values that represent habitat (for example 1 for forest, 2 for wetland). TerraLink requires at least one value.  
 - **Minimum patch size**: patches smaller than this threshold (in pixels) are removed from the main patch set before corridor planning.  
+- **Raster units**: switch between Pixels, Metric (ha/m), and Imperial (ac/ft). Metric/Imperial requires a projected CRS (meters or feet).  
 
 ### Impassable land classes and bottlenecks
 
@@ -177,11 +182,11 @@ Vector mode is designed for polygon patch datasets, where each feature is a sepa
 
 TerraLink supports two optimization modes:
 
-### Largest Network
+### Largest Single Network
 
 - Goal: prioritize building one dominant connected network under the budget.
 
-### Circuit Theory
+### Most Connectivity
 
 - Goal: maximize system-wide utility (ROI) under the budget; redundant links are scored by shortcut efficiency.
 
@@ -196,16 +201,21 @@ For each run, TerraLink can produce:
 - Corridor raster where pixel values indicate the size (in pixels) of the connected component created by including that corridor cell.  
 - Contiguous areas raster where pixel values indicate the size (in pixels) of the connected component for all habitat and corridor cells.  
 - A small in-project summary table layer: `TerraLink Raster Summary (<input layer>)`.
-- A plain-text landscape metrics report (PRE/POST) saved alongside the other outputs (or as a temporary file when using temporary outputs).
+- A plain-text landscape metrics report (PRE/POST) saved alongside the other outputs (or as a temporary file when using temporary outputs). The default filename is `landscape_metrics_<input layer>.txt`.
+- Output raster filenames include the input layer name (for example `terralink_contiguous_<input layer>.tif` and `corridors_terralink_contiguous_<input layer>.tif`).
 
 ### Vector mode outputs
 
 - Corridor layer as a GeoPackage, with each corridor feature containing:  
   - Patch ids it connects  
-  - Length and cost  
-  - Connected area and strategy statistics  
-- A plain-text landscape metrics report (PRE/POST) saved alongside the other outputs (or as a temporary file when using temporary outputs).
-- A summary CSV saved alongside the other outputs (or as a temporary file), also added to QGIS as a table layer.
+  - Corridor area  
+  - Connected area  
+  - Efficiency  
+  - Multipart and segment count flags  
+- A contiguous areas layer in the same GeoPackage (patches + corridors dissolved by connected network).  
+- A plain-text landscape metrics report (PRE/POST) saved alongside the other outputs (or as a temporary file when using temporary outputs). The default filename is `landscape_metrics_<input layer>.txt`.
+- A summary CSV saved alongside the other outputs (or as a temporary file), also added to QGIS as a table layer. The default filename is `terralink_vector_summary_<input layer>.csv`.
+- Vector GeoPackage filenames include the input layer name unless you already include it in the output name.
 
 ### Run summaries
 
@@ -242,7 +252,7 @@ For each run, TerraLink can produce:
 
 ## Credits
 
-TerraLink was created by Ben Bishop (SORUS) as a practical tool for habitat connectivity and corridor planning. Previous to December 15th 2025, it was refered to as Linkscape. Deprecated versions of Linkscape are still available on the QGIS repository. 
+TerraLink was created by Ben Bishop (SORUS) as a practical tool for habitat connectivity and corridor planning. Previous to December 15th 2025, it was released under a different name. Deprecated versions are still available on the QGIS repository. 
 
 TerraLink is built on the QGIS Python API and commonly used geospatial libraries (GDAL/OGR, NumPy).
 

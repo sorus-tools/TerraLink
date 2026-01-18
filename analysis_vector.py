@@ -30,7 +30,7 @@ if not hasattr(np, "int"):  # pragma: no cover
     np.int = int  # type: ignore[attr-defined]
 
 import networkx as nx  # Required for graph-based optimization/metrics
-from .linkscape_engine import NetworkOptimizer, UnionFind
+from .terralink_engine import NetworkOptimizer, UnionFind
 from .core_select import select_circuit_utility
 from .utils import emit_progress, log_error
 # Import the graph-metrics helper library
@@ -431,7 +431,7 @@ class AnalysisContext:
 
 
 def _to_dataclass(params: Dict) -> VectorRunParams:
-    output_name = params.get("output_name") or "linkscape_corridors.gpkg"
+    output_name = params.get("output_name") or "terralink_corridors.gpkg"
     if not output_name.lower().endswith(".gpkg"):
         output_name = f"{output_name}.gpkg"
     obstacle_ids_raw = params.get("obstacle_layer_ids") or []
@@ -451,11 +451,7 @@ def _to_dataclass(params: Dict) -> VectorRunParams:
 
     return VectorRunParams(
         min_corridor_width=float(params.get("min_corridor_width", 200.0)),
-        max_corridor_area=(
-            float(params["max_corridor_area"])
-            if params.get("max_corridor_area") not in (None, 0, 0.0)
-            else None
-        ),
+        max_corridor_area=None,
         min_patch_size=float(params.get("min_patch_size", 10.0)),
         budget_area=float(params.get("budget_area", 50.0)),
         max_search_distance=max_search_distance,
@@ -686,7 +682,6 @@ def _format_no_corridor_reason(
         f"- Candidate corridors generated: {candidate_count}\n"
         f"- Max search distance: {params.max_search_distance:.2f}\n"
         f"- Min corridor width: {params.min_corridor_width:.2f}\n"
-        f"- Max corridor area: {params.max_corridor_area or 'None (no limit)'}\n"
         "Try increasing the search distance, lowering the minimum corridor width/area, "
         "or simplifying the patch layer."
     )
@@ -1341,7 +1336,7 @@ def find_all_possible_corridors(
         strategy_key = "circuit_utility"
     circuit_mode = strategy_key == "circuit_utility"
     largest_network_mode = strategy_key == "largest_network"
-    # Both Circuit Theory and Largest Network (Circuit Utility) need enough candidate
+    # Both Most Connectivity and Largest Single Network (Circuit Utility) need enough candidate
     # diversity to avoid "blind" terminal selection in long/snaking patches.
     utility_mode = strategy_key in ("circuit_utility", "largest_network")
     max_keep_per_pair = 8 if utility_mode else 1
@@ -2003,9 +1998,9 @@ def find_all_possible_corridors(
                     except Exception:
                         extra_patches = []
 
-                    # Largest Network: if a corridor proposal touches another patch C "in between",
+                    # Largest Single Network: if a corridor proposal touches another patch C "in between",
                     # don't keep an A->B corridor that gets clipped across C. Prefer A->C and B->C.
-                    # Circuit Theory already behaves well here via stop-early multipart splitting.
+                    # Most Connectivity already behaves well here via stop-early multipart splitting.
                     blocking_patches: List[int] = []
                     if extra_patches and raw_line is not None and (not raw_line.isEmpty()):
                         for pid in extra_patches:
@@ -2079,7 +2074,7 @@ def find_all_possible_corridors(
                         continue
 
                     # If we touched an intermediate patch but couldn't split into endpoint-local pieces,
-                    # drop this candidate in Largest Network so it doesn't "jump over" the patch.
+                    # drop this candidate in Largest Single Network so it doesn't "jump over" the patch.
                     if largest_network_mode and extra_patches:
                         continue
 
@@ -2143,7 +2138,7 @@ def optimize_largest_network_strategy(
       - largest_network: Grow the largest single network (seed = largest patch), then optional loops.
     """
     if graph_math is None:
-        raise VectorAnalysisError("NetworkX is required for Largest Network optimization but could not be imported.")
+        raise VectorAnalysisError("NetworkX is required for Largest Single Network optimization but could not be imported.")
 
     mode = (mode or "resilient").lower()
     selected: Dict[int, Dict] = {}
@@ -2162,7 +2157,7 @@ def optimize_largest_network_strategy(
         except Exception:
             return
         pk = (a, b) if a <= b else (b, a)
-        # Largest Network should not contain parallel corridors between the same patch pair.
+        # Largest Single Network should not contain parallel corridors between the same patch pair.
         # (Rewires explicitly delete the old edge before adding the replacement.)
         if pk in selected_pairs:
             return
@@ -2191,7 +2186,7 @@ def optimize_largest_network_strategy(
     backbone_edges: List[Tuple[int, int, float, float]] = []
 
     if mode == "largest_network":
-        print("  Strategy: Largest Network")
+        print("  Strategy: Largest Single Network")
         # Seed with largest patch by area and grow outward (Prim-style) to avoid hub-and-spoke
         seed_patch = max(patches.keys(), key=lambda pid: patches[pid]["area_ha"])
         visited: Set[int] = {seed_patch}
@@ -2285,7 +2280,7 @@ def optimize_largest_network_strategy(
         except Exception:
             return 1.0
 
-    # Largest Network should not add a second corridor between the same backbone patch pair.
+    # Largest Single Network should not add a second corridor between the same backbone patch pair.
     # (Users expect redundancy via alternate patch pairs, not parallel duplicates.)
     if mode != "largest_network" and remaining > 0 and selected and backbone_edges:
         _log_message("--- Phase 2a: Reinforcing Existing Links ---")
@@ -2460,7 +2455,7 @@ def optimize_largest_network_strategy(
         "patches_connected": G_final.number_of_nodes(),
         "entropy_total": entropy_stats["H_total"],
         "robustness_rho2": rho2,
-        "mode": "Largest Network",
+        "mode": "Largest Single Network",
         "total_connected_area_ha": sum(p["area_ha"] for p in patches.values()),
         "largest_group_area_ha": 0.0,
     }
@@ -2486,7 +2481,7 @@ def optimize_circuit_utility(
     overlap_reject_ratio: float = 0.30,
 ) -> Tuple[Dict[int, Dict], Dict]:
     """
-    Circuit Theory (Utility) strategy:
+    Most Connectivity (Utility) strategy:
     Weighted greedy selection by marginal utility per cost.
 
     Utility Score:
@@ -2699,11 +2694,11 @@ def optimize_circuit_utility_largest_network(
     overlap_reject_ratio: float = 0.30,
 ) -> Tuple[Dict[int, Dict], Dict]:
     """
-    Largest Network (Circuit Utility):
-    Use the Circuit Theory greedy utility model, but constrain selection to grow
+    Largest Single Network (Circuit Utility):
+    Use the Most Connectivity greedy utility model, but constrain selection to grow
     a single connected component seeded at the largest patch.
 
-    This inherits Circuit Theory behavior (ROI scoring + overlap-aware redundancy),
+    This inherits Most Connectivity behavior (ROI scoring + overlap-aware redundancy),
     but avoids spending budget on disconnected "side networks".
     """
 
@@ -3408,14 +3403,14 @@ def _refresh_vector_connectivity_stats(
     if "largest_group_patches" in stats:
         stats["largest_group_patches"] = int(largest_group_patches)
     if "patches_connected" in stats:
-        if stats.get("strategy") == "largest_network" or stats.get("mode") == "Largest Network":
+        if stats.get("strategy") == "largest_network" or stats.get("mode") == "Largest Single Network":
             stats["patches_connected"] = len(patches)
         else:
             stats["patches_connected"] = int(largest_group_patches)
     if "total_connected_area_ha" in stats:
         stats["total_connected_area_ha"] = sum(float(p.get("area_ha", 0.0) or 0.0) for p in patches.values())
 
-    use_global = stats.get("strategy") == "largest_network" or stats.get("mode") == "Largest Network"
+    use_global = stats.get("strategy") == "largest_network" or stats.get("mode") == "Largest Single Network"
     for data in corridors.values():
         if use_global:
             connected_area = largest_group_area
@@ -3554,6 +3549,7 @@ def _safe_unary_union(geoms: List[QgsGeometry]) -> Optional[QgsGeometry]:
 def build_contiguous_network_summaries(
     patches: Dict[int, Dict],
     corridors: Dict[int, Dict],
+    dissolve_tolerance: float = 0.0,
 ) -> List[Dict]:
     """Group patches/corridors into connected networks and dissolve geometries per network."""
     if not patches:
@@ -3606,6 +3602,13 @@ def build_contiguous_network_summaries(
             corridor_area_ha += float(cdata.get("area_ha", 0.0) or 0.0)
 
         net_geom = _safe_unary_union(geom_parts)
+        if net_geom and (not net_geom.isEmpty()) and dissolve_tolerance > 0.0:
+            try:
+                net_geom = net_geom.buffer(dissolve_tolerance, BUFFER_SEGMENTS)
+                net_geom = net_geom.buffer(-dissolve_tolerance, BUFFER_SEGMENTS)
+                net_geom = net_geom.makeValid()
+            except Exception:
+                pass
 
         summaries.append(
             {
@@ -3912,6 +3915,15 @@ def run_vector_analysis(
     timings = TimingRecorder()
 
     params = _to_dataclass(raw_params)
+    safe_layer = _safe_filename(layer.name())
+    try:
+        base_name, ext = os.path.splitext(params.output_name or "")
+        ext = ext or ".gpkg"
+        if safe_layer and safe_layer.lower() not in (base_name or "").lower():
+            base_name = base_name or "terralink_corridors"
+            params.output_name = f"{base_name}_{safe_layer}{ext}"
+    except Exception:
+        pass
     ctx = ctx or AnalysisContext()
     unit_system = params.unit_system
     area_factor = 2.471053814 if unit_system == "imperial" else 1.0
@@ -4067,10 +4079,10 @@ def run_vector_analysis(
     with timings.time_block(opt_label):
         if strategy_key == "largest_network":
             corridors, stats = optimize_circuit_utility_largest_network(patches, all_possible, params)
-            layer_name = "Corridors (Largest Network)"
+            layer_name = "Corridors (Largest Single Network)"
         elif strategy_key == "circuit_utility":
             corridors, stats = optimize_circuit_utility(patches, all_possible, params)
-            layer_name = "Corridors (Circuit Theory)"
+            layer_name = "Corridors (Most Connectivity)"
         else:
             raise VectorAnalysisError(f"Unsupported strategy '{strategy_key}'.")
 
@@ -4123,7 +4135,8 @@ def run_vector_analysis(
         # Contiguous network areas (patches + corridors dissolved per connected network)
         networks: List[Dict] = []
         try:
-            networks = build_contiguous_network_summaries(patches, corridors)
+            dissolve_tolerance = max(0.0, float(getattr(params, "min_corridor_width", 0.0) or 0.0) * 0.01)
+            networks = build_contiguous_network_summaries(patches, corridors, dissolve_tolerance=dissolve_tolerance)
             networks_layer_name = "Contiguous Areas"
             if temporary:
                 create_memory_layer_from_networks(networks, networks_layer_name, target_crs, original_crs, unit_system)
@@ -4159,12 +4172,7 @@ def run_vector_analysis(
             strategy_key = (strategy or "circuit_utility").lower()
             if strategy_key not in ("largest_network", "circuit_utility"):
                 strategy_key = "circuit_utility"
-            if strategy_key == "largest_network":
-                strategy_label = "Largest Network"
-            else:
-                strategy_label = "Circuit Theory"
-
-            analysis_layer_name = f"Contiguous Areas ({strategy_label})"
+            analysis_layer_name = f"TerraLink Landscape Metrics ({layer.name()})"
             pixel_size_m = float(getattr(params, "grid_resolution", 50.0) or 50.0)
             patch_geoms = [pdata.get("geom") for pdata in patches.values() if pdata.get("geom") and not pdata.get("geom").isEmpty()]
             network_geoms = [net.get("geom") for net in networks if net.get("geom") and not net.get("geom").isEmpty()]
@@ -4203,13 +4211,13 @@ def run_vector_analysis(
                 safe = _safe_filename(layer.name())
                 landscape_metrics_path = os.path.join(
                     os.path.dirname(output_path) or os.getcwd(),
-                    f"landscape_metrics_{safe}_{strategy_key}.txt",
+                    f"landscape_metrics_{safe}.txt",
                 )
             _write_text_report(landscape_metrics_path, analysis_lines)
             stats["landscape_metrics_path"] = landscape_metrics_path
             print(f"  ✓ Saved landscape metrics: {landscape_metrics_path}")
             try:
-                _add_landscape_metrics_table_layer(f"Landscape Metrics ({analysis_layer_name})", analysis_lines)
+                _add_landscape_metrics_table_layer(analysis_layer_name, analysis_lines)
             except Exception:
                 pass
         except Exception as e:  # noqa: BLE001
@@ -4223,12 +4231,9 @@ def run_vector_analysis(
                         temp_file.close()
                     else:
                         safe = _safe_filename(layer.name())
-                        strategy_key = (strategy or "circuit_utility").lower()
-                        if strategy_key not in ("largest_network", "circuit_utility"):
-                            strategy_key = "circuit_utility"
                         landscape_metrics_path = os.path.join(
                             os.path.dirname(output_path) or os.getcwd(),
-                            f"landscape_metrics_{safe}_{strategy_key}.txt",
+                            f"landscape_metrics_{safe}.txt",
                         )
                 _write_text_report(landscape_metrics_path, [f"Landscape analysis failed: {e}"])
                 stats["landscape_metrics_path"] = landscape_metrics_path
@@ -4252,9 +4257,9 @@ def run_vector_analysis(
     if strategy_key not in ("largest_network", "circuit_utility"):
         strategy_key = "circuit_utility"
     if strategy_key == "largest_network":
-        strategy_label = "Largest Network"
+        strategy_label = "Largest Single Network"
     else:
-        strategy_label = "Circuit Theory"
+        strategy_label = "Most Connectivity"
     print(f"Strategy:          {strategy_label}")
     print(f"Corridors created: {stats.get('corridors_used', 0)}")
     print(f"Connections:       {stats.get('connections_made', 0)}")
@@ -4286,7 +4291,7 @@ def run_vector_analysis(
             summary_path = temp_file.name
             temp_file.close()
         else:
-            summary_path = os.path.join(summary_dir, f"terralink_vector_summary_{safe}_{strategy_key}.csv")
+            summary_path = os.path.join(summary_dir, f"terralink_vector_summary_{safe}.csv")
         rows = [
             ("Input layer", layer.name()),
             ("Strategy", strategy_label),

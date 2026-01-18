@@ -1,3 +1,3 @@
 def classFactory(iface):
-    from .linkscape import TerraLinkPlugin
+    from .terralink import TerraLinkPlugin
     return TerraLinkPlugin(iface)

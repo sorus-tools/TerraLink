@@ -85,6 +85,8 @@ PIXEL_COUNT_WARNING_THRESHOLD = 40_000_000  # warn when raster exceeds ~40 milli
 PIXEL_SIZE_WARNING_THRESHOLD = 10.0  # warn when pixel size < 10 map units
 PIXEL_FINE_CRITICAL_COUNT = 2_000_000  # only block fine rasters when they are also large
 ROI_REDUNDANCY_BIAS = 0.2  # prefer new connections unless redundancy ROI is clearly higher
+# Heuristic work-unit cap to keep Circuit Utility runs under ~3 minutes on fast hardware.
+MAX_CANDIDATE_SEARCH_WORK = 6000.0
 
 def _log_message(message: str, level: int = Qgis.Info) -> None:
     """Log to the QGIS Log Messages Panel with a TerraLink tag."""
@@ -92,6 +94,12 @@ def _log_message(message: str, level: int = Qgis.Info) -> None:
         QgsApplication.messageLog().logMessage(message, "TerraLink", level)
     except Exception:
         print(f"TerraLink Log: {message}")
+
+
+def _safe_filename(name: str, max_len: int = 64) -> str:
+    safe = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in (name or ""))
+    safe = safe.strip("_") or "layer"
+    return safe[:max_len]
 
 
 def _apply_random_unique_value_symbology(layer: "QgsRasterLayer", values: List[int]) -> None:
@@ -731,6 +739,40 @@ def _filter_start_positions_near(
     return out
 
 
+def _estimate_search_work_units(estimated_searches: int, total_pixels: int) -> float:
+    """Estimate search work units for circuit candidate generation."""
+    if estimated_searches <= 0:
+        return 0.0
+    # Scale by ~250k-pixel blocks (heuristic for keeping runs under a few minutes).
+    pixels_factor = max(1.0, float(total_pixels) / 250_000.0)
+    return float(estimated_searches) * pixels_factor
+
+
+def _maybe_block_large_candidate_search(
+    *,
+    strategy_label: str,
+    estimated_searches: int,
+    candidate_pairs: int,
+    total_pixels: int,
+    min_patch_size: int,
+    max_search_distance: int,
+    min_corridor_width: int,
+) -> None:
+    """Raise if estimated candidate search is likely to exceed practical runtime."""
+    work_units = _estimate_search_work_units(estimated_searches, total_pixels)
+    if work_units <= MAX_CANDIDATE_SEARCH_WORK:
+        return
+    msg = (
+        f"Corridor search too large for {strategy_label} (est. {estimated_searches:,} searches across "
+        f"{candidate_pairs:,} pairs for {total_pixels:,} raster pixels; "
+        f"min patch {min_patch_size}px, max search {max_search_distance}px, "
+        f"min width {min_corridor_width}px). "
+        "Try increasing min patch size, lowering max search distance, "
+        "reducing corridor width, clipping the study area, or resampling to coarser resolution."
+    )
+    raise RasterAnalysisError(msg)
+
+
 def _generate_boundary_pair_seeds(
     labels: np.ndarray,
     patch_ids: List[int],
@@ -850,6 +892,7 @@ def find_all_possible_corridors(
     """Find all possible corridors between patch pairs."""
     print("  Finding all possible corridors...")
     rows, cols = labels.shape
+    total_pixels = int(rows * cols)
     all_corridors: List[Dict] = []
     processed_pairs: Set[frozenset] = set()
     offsets = _corridor_offsets(min_corridor_width)
@@ -873,7 +916,7 @@ def find_all_possible_corridors(
     if strategy_key not in ("largest_network", "circuit_utility"):
         strategy_key = "circuit_utility"
     circuit_mode = strategy_key == "circuit_utility"
-    # Largest Network mode keeps the fast multi-target search, but adds a targeted micro-gap pass
+    # Largest Single Network mode keeps the fast multi-target search, but adds a targeted micro-gap pass
     # to catch obvious missed bridges (boundary-aware + gap-aware).
     micro_gap_mode = strategy_key in ("largest_network",)
 
@@ -966,14 +1009,14 @@ def find_all_possible_corridors(
                 "area": area_px,
                 "buffered_pixels": frozenset(buffered),
                 "variant": tag,
-                # Used by Circuit Theory overlap logic to treat near-parallel corridors as overlap.
+                # Used by Most Connectivity overlap logic to treat near-parallel corridors as overlap.
                 "_prox_radius": int(prox_radius),
             }
         )
 
     if circuit_mode:
         # ------------------------------------------------------------------
-        # CIRCUIT THEORY: boundary-aware + gap-aware candidate generation
+        # MOST CONNECTIVITY: boundary-aware + gap-aware candidate generation
         #
         # Instead of "search until you touch any patch", we:
         #  - build boundary-to-boundary seed pairs for nearby patch pairs
@@ -991,6 +1034,17 @@ def find_all_possible_corridors(
             max_seeds_per_pair=8,
         )
         _record_timing("pair_seed_build", t_seed)
+        if pair_seeds:
+            est_searches = sum(len(seeds) for seeds in pair_seeds.values())
+            _maybe_block_large_candidate_search(
+                strategy_label="Circuit Utility",
+                estimated_searches=int(est_searches),
+                candidate_pairs=len(pair_seeds),
+                total_pixels=total_pixels,
+                min_patch_size=int(params.min_patch_size) if params is not None else 0,
+                max_search_distance=int(max_width),
+                min_corridor_width=int(min_corridor_width),
+            )
         if not pair_seeds:
             try:
                 _log_message(
@@ -2018,7 +2072,7 @@ def optimize_circuit_utility(
     overlap_reject_ratio: float = 0.30,
 ) -> Tuple[Dict[int, Dict], Dict]:
     """
-    Circuit Theory (Utility) strategy for raster candidates.
+    Most Connectivity (Utility) strategy for raster candidates.
 
     Uses a weighted greedy loop over corridor candidates:
       score = (sqrt(size_p1 * size_p2) / cost) * multiplier
@@ -2241,6 +2295,35 @@ def _refresh_raster_component_stats(
         stats["components_remaining"] = len(comp_counts)
     elif patch_sizes:
         stats["components_remaining"] = len(patch_sizes)
+
+
+def _min_unselected_candidate_cost(candidates: List[Dict], corridors: Dict[int, Dict]) -> Optional[int]:
+    """Return the minimum corridor cost among candidates not already selected."""
+    if not candidates:
+        return None
+    selected_pairs: Set[Tuple[int, int]] = set()
+    for data in corridors.values():
+        pids = list(data.get("patch_ids", []))
+        if len(pids) >= 2:
+            selected_pairs.add(tuple(sorted((int(pids[0]), int(pids[1])))))
+    min_cost: Optional[int] = None
+    for cand in candidates:
+        try:
+            p1 = int(cand.get("patch1", 0) or 0)
+            p2 = int(cand.get("patch2", 0) or 0)
+        except Exception:
+            continue
+        if p1 <= 0 or p2 <= 0:
+            continue
+        pair = (p1, p2) if p1 <= p2 else (p2, p1)
+        if pair in selected_pairs:
+            continue
+        cost = int(cand.get("area", 0) or 0)
+        if cost <= 0:
+            continue
+        if min_cost is None or cost < min_cost:
+            min_cost = cost
+    return min_cost
 
 
 def _apply_hybrid_leftover_budget_raster(
@@ -2488,9 +2571,7 @@ def _to_dataclass(params: Dict) -> RasterRunParams:
         min_patch_size=int(params.get("min_patch_size", 30)),
         budget_pixels=int(params.get("budget_pixels", 10)),
         max_search_distance=int(params.get("max_search_distance", 50)),
-        max_corridor_area=(
-            int(params["max_corridor_area"]) if params.get("max_corridor_area") is not None else None
-        ),
+        max_corridor_area=None,
         min_corridor_width=int(params.get("min_corridor_width", 1)),
         allow_bottlenecks=bool(params.get("allow_bottlenecks", True)),
     )
@@ -2557,6 +2638,42 @@ def _add_raster_run_summary_layer(
 
         _add("Input layer", input_layer_name)
         _add("Strategy", str(strategy))
+        rows = stats.get("raster_rows")
+        cols = stats.get("raster_cols")
+        total_px = stats.get("raster_pixels_total")
+        if rows is not None and cols is not None:
+            if total_px is None:
+                size_val = f"{int(rows):,} x {int(cols):,}"
+            else:
+                size_val = f"{int(rows):,} x {int(cols):,} ({int(total_px):,})"
+            _add("Raster size (px)", size_val)
+        raw_patches = stats.get("patches_total_raw")
+        filtered_patches = stats.get("patches_total_filtered")
+        if raw_patches is not None or filtered_patches is not None:
+            raw_display = "" if raw_patches is None else f"{int(raw_patches):,}"
+            filt_display = "" if filtered_patches is None else f"{int(filtered_patches):,}"
+            patches_val = raw_display or filt_display
+            if raw_display and filt_display:
+                patches_val = f"{raw_display} / {filt_display}"
+            _add("Patches (raw / filtered)", patches_val)
+        if stats.get("min_patch_size") is not None:
+            _add("Min patch size (px)", stats.get("min_patch_size"))
+        if stats.get("max_search_distance") is not None:
+            _add("Max search distance (px)", stats.get("max_search_distance"))
+        if stats.get("min_corridor_width") is not None:
+            _add("Min corridor width (px)", stats.get("min_corridor_width"))
+        candidate_pairs = stats.get("candidate_pairs")
+        possible_pairs = stats.get("possible_pairs")
+        if candidate_pairs is not None:
+            if possible_pairs:
+                _add("Candidate pairs", f"{int(candidate_pairs):,} / {int(possible_pairs):,}")
+            else:
+                _add("Candidate pairs", f"{int(candidate_pairs):,}")
+        if stats.get("candidate_corridors") is not None:
+            _add("Candidate corridors", stats.get("candidate_corridors"))
+        candidate_time = stats.get("candidate_search_s")
+        if candidate_time is not None:
+            _add("Candidate search time (s)", f"{float(candidate_time):.2f}")
         _add("Corridors created", stats.get("corridors_used", 0))
         _add("Patches connected", stats.get("patches_connected", 0))
         _add("Connected groups", stats.get("components_remaining", 0))
@@ -2703,18 +2820,18 @@ def _perform_landscape_analysis(
     specs = [
         ("Total Area", "total_area", "{:,.2f}", area_unit),
         ("Num. Patches (NP)", "num_patches", "{:,.0f}", "count"),
-        ("Eff. Mesh Size", "mesh", "{:,.2f}", f"{area_unit} (Functional size)"),
+        ("Eff. Mesh Size", "mesh", "{:,.2f}", f"{area_unit} (effective connected habitat at landscape scale)"),
         ("Largest Patch Size", "lps", "{:,.2f}", area_unit),
-        ("Splitting Index", "split", "{:,.2f}", "1 = solid, High = broken"),
-        ("Patch Density (PD)", "pd", "{:,.2f}", "Patches per 100 units"),
+        ("Splitting Index", "split", "{:,.2f}", "Higher = more fragmented"),
+        ("Patch Density (PD)", "pd", "{:,.2f}", f"Patches per 100 {area_unit}"),
         ("Largest Patch Index (LPI)", "lpi", "{:,.2f}", "% of landscape"),
         ("Total Edge", "total_edge", "{:,.2f}", dist_unit),
-        ("Mean Shape Index (MSI)", "msi", "{:,.2f}", "1.0 = Square, >1 = Complex"),
+        ("Mean Shape Index (MSI)", "msi", "{:,.2f}", "1 = compact, higher = irregular"),
         ("Edge Density (ED)", "ed", "{:,.2f}", f"{dist_unit} edge per {area_unit}"),
         ("Mean PARA", "mean_para", "{:,.5f}", "Perimeter-Area Ratio"),
         ("Fractal Dimension", "frac", "{:,.2f}", "Complexity scale"),
         ("Aggregation Index (AI)", "ai", "{:,.2f}", "0 = Dispersed, 100 = Clumped"),
-        ("Core Area Index (CAI)", "cai", "{:,.2f}", "% non-peninsula"),
+        ("Core Area Index (CAI)", "cai", "{:,.2f}", "% core habitat (excluding edge effects)"),
         ("Mean Radius of Gyration", "mean_gyrate", "{:,.2f}", f"{gyrate_unit} (Internal reach)"),
     ]
 
@@ -2854,6 +2971,7 @@ def _run_raster_analysis_core(
     t0 = time.time()
     labels, n_patches = label_patches(habitat_mask, params.patch_connectivity)
     print(f"  ✓ Patches: {n_patches:,} in {time.time() - t0:.2f}s")
+    raw_patch_count = int(n_patches)
 
     # Preserve the full label map (including small patches) so the contiguous output
     # can include "bridge patches" that were filtered out by min_patch_size but were
@@ -2886,9 +3004,11 @@ def _run_raster_analysis_core(
     patch_sizes = dict(zip(unique_labels.tolist(), counts.tolist()))
     if not patch_sizes:
         raise RasterAnalysisError("No valid patches remain after filtering.")
+    filtered_patch_count = len(patch_sizes)
     _emit_progress(progress_cb, 45, "Searching for corridors…")
 
     print("\n4. Finding possible corridors...")
+    candidate_start = time.perf_counter()
     candidates = find_all_possible_corridors(
         labels,
         habitat_mask,
@@ -2906,7 +3026,20 @@ def _run_raster_analysis_core(
         params=params,
         timing_out=None,
     )
+    candidate_elapsed = time.perf_counter() - candidate_start
     candidate_count = len(candidates)
+    candidate_pairs: Set[Tuple[int, int]] = set()
+    for cand in candidates:
+        try:
+            p1 = int(cand.get("patch1", 0))
+            p2 = int(cand.get("patch2", 0))
+        except Exception:
+            continue
+        if p1 <= 0 or p2 <= 0:
+            continue
+        candidate_pairs.add((p1, p2) if p1 <= p2 else (p2, p1))
+    candidate_pairs_count = len(candidate_pairs)
+    possible_pairs = (filtered_patch_count * (filtered_patch_count - 1)) // 2 if filtered_patch_count > 1 else 0
 
     if not candidates:
         raise RasterAnalysisError("No feasible corridors found with the current configuration.")
@@ -2915,16 +3048,18 @@ def _run_raster_analysis_core(
     strategy = (strategy or "circuit_utility").lower()
     if strategy not in ("largest_network", "circuit_utility"):
         strategy = "circuit_utility"
+    safe_layer = _safe_filename(layer.name())
+    default_filename = f"terralink_contiguous_{safe_layer}.tif"
     strategy_map = {
         "largest_network": (
             optimize_largest_network,
-            "contiguous_areas_largest_network.tif",
-            "Contiguous Areas (Largest Network)",
+            default_filename,
+            "Contiguous Areas (Largest Single Network)",
         ),
         "circuit_utility": (
             optimize_circuit_utility,
-            "contiguous_areas_circuit_utility.tif",
-            "Contiguous Areas (Circuit Theory)",
+            default_filename,
+            "Contiguous Areas (Most Connectivity)",
         ),
     }
 
@@ -2942,21 +3077,29 @@ def _run_raster_analysis_core(
         raise RasterAnalysisError("Selected optimization did not produce any corridors.")
     remaining_budget = int(max(0, int(params.budget_pixels) - int(stats.get("budget_used", 0) or 0)))
     if remaining_budget > 0:
-        extra_used, low_value_added, redundancy_added = _apply_hybrid_leftover_budget_raster(
-            candidates=candidates,
-            corridors=corridors,
-            patch_sizes=patch_sizes,
-            remaining_budget=remaining_budget,
-        )
-        if extra_used:
-            stats["budget_used"] = int(stats.get("budget_used", 0) or 0) + int(extra_used)
-            stats["corridors_used"] = len(corridors)
-            if "primary_links" in stats:
-                stats["primary_links"] = int(stats.get("primary_links", 0) or 0) + int(low_value_added)
-            if "redundant_links" in stats:
-                stats["redundant_links"] = int(stats.get("redundant_links", 0) or 0) + int(redundancy_added)
-            _refresh_raster_component_stats(corridors, patch_sizes, stats)
-        remaining_budget = int(max(0, int(params.budget_pixels) - int(stats.get("budget_used", 0) or 0)))
+        min_extra_cost = _min_unselected_candidate_cost(candidates, corridors)
+        if min_extra_cost is not None and remaining_budget < int(min_extra_cost):
+            stats["remaining_budget_unusable"] = remaining_budget
+            stats["min_unselected_corridor_cost"] = int(min_extra_cost)
+            print(
+                "  Remaining budget too small to add new corridors; skipping extra selection."
+            )
+        else:
+            extra_used, low_value_added, redundancy_added = _apply_hybrid_leftover_budget_raster(
+                candidates=candidates,
+                corridors=corridors,
+                patch_sizes=patch_sizes,
+                remaining_budget=remaining_budget,
+            )
+            if extra_used:
+                stats["budget_used"] = int(stats.get("budget_used", 0) or 0) + int(extra_used)
+                stats["corridors_used"] = len(corridors)
+                if "primary_links" in stats:
+                    stats["primary_links"] = int(stats.get("primary_links", 0) or 0) + int(low_value_added)
+                if "redundant_links" in stats:
+                    stats["redundant_links"] = int(stats.get("redundant_links", 0) or 0) + int(redundancy_added)
+                _refresh_raster_component_stats(corridors, patch_sizes, stats)
+            remaining_budget = int(max(0, int(params.budget_pixels) - int(stats.get("budget_used", 0) or 0)))
     if remaining_budget > 0:
         thickened = _thicken_corridors_raster(
             corridors=corridors,
@@ -3015,37 +3158,42 @@ def _run_raster_analysis_core(
         # --- LANDSCAPE METRICS REPORT (always written) ---
         landscape_metrics_path = ""
         analysis_lines: List[str] = []
+        analysis_title = f"TerraLink Landscape Metrics ({layer.name()})"
         try:
             is_metric = (layer.crs().mapUnits() == QgsUnitTypes.DistanceMeters)
             analysis_lines = _perform_landscape_analysis(
                 network_output,
-                layer_name,
+                analysis_title,
                 abs(gt[1]),
                 abs(gt[5]),
                 is_metric,
                 params=params,
                 pre_arr=patch_mask,
             )
-            safe = "".join(ch if ch.isalnum() or ch in ("_", "-", " ") else "_" for ch in (layer.name() or "raster")).strip()
-            safe = "_".join(safe.split())[:80] if safe else "run"
-            landscape_metrics_path = os.path.join(os.path.dirname(out_path) or os.getcwd(), f"landscape_metrics_{safe}_{strategy}.txt")
+            safe = _safe_filename(layer.name())
+            landscape_metrics_path = os.path.join(
+                os.path.dirname(out_path) or os.getcwd(),
+                f"landscape_metrics_{safe}.txt",
+            )
             _write_text_report(landscape_metrics_path, analysis_lines)
             print(f"  ✓ Saved landscape metrics: {landscape_metrics_path}")
             try:
-                _add_landscape_metrics_table_layer(f"Landscape Metrics ({layer_name})", analysis_lines)
+                _add_landscape_metrics_table_layer(analysis_title, analysis_lines)
             except Exception:
                 pass
         except Exception as e:
             # Always write a report, even if computation fails.
             try:
-                safe = "".join(ch if ch.isalnum() or ch in ("_", "-", " ") else "_" for ch in (layer.name() or "raster")).strip()
-                safe = "_".join(safe.split())[:80] if safe else "run"
-                landscape_metrics_path = os.path.join(os.path.dirname(out_path) or os.getcwd(), f"landscape_metrics_{safe}_{strategy}.txt")
+                safe = _safe_filename(layer.name())
+                landscape_metrics_path = os.path.join(
+                    os.path.dirname(out_path) or os.getcwd(),
+                    f"landscape_metrics_{safe}.txt",
+                )
                 analysis_lines = [f"Landscape analysis failed: {e}"]
                 _write_text_report(landscape_metrics_path, analysis_lines)
                 print(f"  ✓ Saved landscape metrics: {landscape_metrics_path}")
                 try:
-                    _add_landscape_metrics_table_layer(f"Landscape Metrics ({layer_name})", analysis_lines)
+                    _add_landscape_metrics_table_layer(analysis_title, analysis_lines)
                 except Exception:
                     pass
             except Exception:
@@ -3082,6 +3230,20 @@ def _run_raster_analysis_core(
     stats["budget_total"] = params.budget_pixels
     stats["patches_total"] = stats.get("patches_total", len(patch_sizes))
     stats["habitat_pixels_total"] = sum(patch_sizes.values())
+    stats["raster_rows"] = rows
+    stats["raster_cols"] = cols
+    stats["raster_pixels_total"] = total_pixels
+    stats["patches_total_raw"] = raw_patch_count
+    stats["patches_total_filtered"] = filtered_patch_count
+    stats["min_patch_size"] = params.min_patch_size
+    stats["max_search_distance"] = params.max_search_distance
+    stats["min_corridor_width"] = params.min_corridor_width
+    stats["candidate_corridors"] = candidate_count
+    stats["candidate_pairs"] = candidate_pairs_count
+    stats["possible_pairs"] = possible_pairs
+    stats["candidate_search_s"] = candidate_elapsed
+    stats["passable_cells"] = passable_cells
+    stats["obstacle_pixels"] = obstacle_pixels
     stats.update(_compute_connectivity_metrics(corridors, patch_sizes))
 
     print("\n" + "=" * 70)

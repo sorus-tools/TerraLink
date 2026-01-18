@@ -1,11 +1,11 @@
 [general]
 name=TerraLink
 qgisMinimumVersion=3.22
-version=1.3
+version=1.4
 author=Ben Bishop
 email=benjamin.james.bishop@gmail.com
 description=QGIS plugin for ecological corridor generation and habitat connectivity analysis using raster and vector workflows.
-about=TerraLink identifies and optimizes ecological corridors connecting fragmented habitats using graph-based algorithms. Supports both raster (land cover grids) and vector (polygon patches) modes with optimization strategies (Largest Network and Circuit Theory), optional impassable land classes, budget constraints, and flexible patch definitions for conservation planning at multiple scales.
+about=TerraLink identifies and optimizes ecological corridors connecting fragmented habitats using graph-based algorithms. Supports both raster (land cover grids) and vector (polygon patches) modes with optimization strategies (Largest Single Network and Most Connectivity), optional impassable land classes, budget constraints, and flexible patch definitions for conservation planning at multiple scales.
 category=Analysis
 tags=ecology,connectivity,corridor,habitat,conservation,raster,vector,landscape,restoration,optimization,graph,theory,biodiversity,forest,planning
 icon=icon.png
@@ -14,5 +14,5 @@ deprecated=False
 homepage=https://github.com/sorus-tools/Linkscape
 repository=https://github.com/sorus-tools/Linkscape
 tracker=https://github.com/sorus-tools/Linkscape/issues
-changelog=v1.3: Shortcut efficiency scoring for redundancy, target-importance scaling, pre/post landscape metrics, vector summary CSV/table, leftover-budget thickening + low-value inclusion, and corridors layer order fix. v1.2.0: Prior release. v1.1.0: Prior release. v1.0.0: Initial TerraLink release.
+changelog=v1.4: Interface cleanup, vector workflow consistency improvements, raster parity updates, contiguous areas dissolve fix, and output naming updates. v1.3: Shortcut efficiency scoring for redundancy, target-importance scaling, pre/post landscape metrics, vector summary CSV/table, leftover-budget thickening + low-value inclusion, and corridors layer order fix. v1.2.0: Prior release. v1.1.0: Prior release. v1.0.0: Initial TerraLink release.
 license=GPL-2.0-or-later

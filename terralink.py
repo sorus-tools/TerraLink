@@ -5,6 +5,10 @@ from qgis.PyQt.QtWidgets import QAction
 from qgis.core import QgsApplication
 
 from .processing_provider import TerraLinkProcessingProvider
+try:
+    from qgis.PyQt import sip
+except Exception:  # pragma: no cover
+    sip = None
 
 
 class TerraLinkPlugin:
@@ -33,11 +37,17 @@ class TerraLinkPlugin:
             self.iface.removeToolBarIcon(self.action)
             self.iface.removePluginMenu("&TerraLink", self.action)
         if self.provider is not None:
-            QgsApplication.processingRegistry().removeProvider(self.provider)
+            try:
+                registry = QgsApplication.processingRegistry()
+                if registry is not None:
+                    if sip is None or not sip.isdeleted(self.provider):
+                        registry.removeProvider(self.provider)
+            except RuntimeError:
+                pass
             self.provider = None
 
     def run(self):
-        from .linkscape_dialog import LinkscapeDialog
+        from .terralink_dialog import TerraLinkDialog
 
-        dialog = LinkscapeDialog(self.iface)
+        dialog = TerraLinkDialog(self.iface)
         dialog.exec_()

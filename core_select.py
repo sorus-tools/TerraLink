@@ -5,7 +5,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, DefaultDict, Dict, Generic, Iterable, List, Optional, Sequence, Tuple, TypeVar
 
-from .linkscape_engine import UnionFind
+from .terralink_engine import UnionFind
 try:
     import networkx as nx
 except Exception:  # pragma: no cover
@@ -45,7 +45,7 @@ def select_circuit_utility(
     shortcut_mult_low: float = 0.1,
 ) -> Tuple[List[CircuitPick[T]], Dict[str, object]]:
     """
-    Shared Circuit Theory greedy selector used by raster + vector.
+    Shared Most Connectivity greedy selector used by raster + vector.
 
     score = base_roi * multiplier
 
