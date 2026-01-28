@@ -1,4 +1,4 @@
-# TerraLink QGIS Plugin 1.4
+# TerraLink QGIS Plugin 1.5
 
 **Ecological Corridor Optimization for Habitat Connectivity**
 
@@ -9,19 +9,18 @@ Image: Corridors generated (pink) to strategically connect the maximum landscape
 
 ---
 
-## What’s New in 1.4
+## What’s New in 1.5
 
-- **Cleaner, more predictable interface behavior**
-  - Settings and controls are organized more clearly in one place.
-  - Invalid or conflicting options are easier to catch, with clearer feedback about what will actually run.
-  - Fewer odd results caused by unnoticed settings.
-- **More robust and consistent vector analysis**
-  - Vector workflow is now the main reference implementation.
-  - Rules for terminal selection, spacing, and strategy behavior are clearer and more consistent.
-  - Small sample sizes, odd-shaped areas, and edge effects are handled intentionally.
-- **Raster analysis now behaves more like the vector version**
-  - Raster workflows follow the same logic and assumptions as vector workflows.
-  - The tool is clearer about when analysis starts/stops and how failures are handled.
+- **Cleaner, more predictable UI + validation**
+  - Controls are organized more clearly.
+  - Conflicting/invalid settings are caught earlier.
+  - Clearer feedback reduces “mystery” outcomes from unnoticed options.
+- **Vector mode is more robust (reference path)**
+  - Terminal selection, spacing, and strategy behavior are more internally consistent.
+  - Better handling of small N, weird shapes, and edge effects.
+- **Raster mode now behaves more like vector mode**
+  - Follows the same core logic/assumptions more closely.
+  - Clearer about run start/stop conditions and failure handling.
 
 ## Table of Contents
 

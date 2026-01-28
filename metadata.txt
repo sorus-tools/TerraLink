@@ -1,7 +1,7 @@
 [general]
 name=TerraLink
 qgisMinimumVersion=3.22
-version=1.4
+version=1.5
 author=Ben Bishop
 email=benjamin.james.bishop@gmail.com
 description=QGIS plugin for ecological corridor generation and habitat connectivity analysis using raster and vector workflows.
@@ -14,5 +14,5 @@ deprecated=False
 homepage=https://github.com/sorus-tools/Linkscape
 repository=https://github.com/sorus-tools/Linkscape
 tracker=https://github.com/sorus-tools/Linkscape/issues
-changelog=v1.4: Interface cleanup, vector workflow consistency improvements, raster parity updates, contiguous areas dissolve fix, and output naming updates. v1.3: Shortcut efficiency scoring for redundancy, target-importance scaling, pre/post landscape metrics, vector summary CSV/table, leftover-budget thickening + low-value inclusion, and corridors layer order fix. v1.2.0: Prior release. v1.1.0: Prior release. v1.0.0: Initial TerraLink release.
+changelog=v1.5: Cleaner, more predictable UI + validation: controls are organized more clearly, conflicting/invalid settings are caught earlier, and the dialog gives clearer feedback so you get fewer "mystery" outcomes from unnoticed options. Vector mode is more robust (and effectively the reference path): terminal selection, spacing, and strategy behavior are more internally consistent, with better handling of small N, weird shapes, and edge effects. Raster mode now behaves more like vector mode: it follows the same core logic/assumptions more closely, and it’s clearer about run start/stop conditions and failure handling. v1.4: Interface cleanup, vector workflow consistency improvements, raster parity updates, contiguous areas dissolve fix, and output naming updates. v1.3: Shortcut efficiency scoring for redundancy, target-importance scaling, pre/post landscape metrics, vector summary CSV/table, leftover-budget thickening + low-value inclusion, and corridors layer order fix. v1.2.0: Prior release. v1.1.0: Prior release. v1.0.0: Initial TerraLink release.
 license=GPL-2.0-or-later

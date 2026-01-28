@@ -25,7 +25,6 @@ from qgis.PyQt.QtWidgets import (
     QScrollArea,
     QPlainTextEdit,
     QProgressBar,
-    QMessageBox,
     QDialogButtonBox,
     QListWidget,
     QLineEdit,
@@ -60,7 +59,6 @@ class TerraLinkDialog(QDialog, FORM_CLASS):
         self._reframe_ui()
 
         self.output_dir_line.setPlaceholderText("Select output folder…")
-
         self._parameters = {}
         self.available_layers = {}
         self._current_layer_type = "raster"
@@ -925,13 +923,15 @@ class TerraLinkDialog(QDialog, FORM_CLASS):
             self.label_vector_max_search.setText("Max Search Distance (ft):")
             self.label_vector_min_patch.setText("Min Patch Size (ac):")
             self.label_vector_budget.setText("Budget (ac):")
-            self.label_vector_max_area.setText("Max Corridor Area (ac):")
+            if hasattr(self, "label_vector_max_area"):
+                self.label_vector_max_area.setText("Max Corridor Area (ac):")
         else:
             self.label_vector_min_width.setText("Min Corridor Width (m):")
             self.label_vector_max_search.setText("Max Search Distance (m):")
             self.label_vector_min_patch.setText("Min Patch Size (ha):")
             self.label_vector_budget.setText("Budget (ha):")
-            self.label_vector_max_area.setText("Max Corridor Area (ha):")
+            if hasattr(self, "label_vector_max_area"):
+                self.label_vector_max_area.setText("Max Corridor Area (ha):")
 
     def _map_units_to_meters(self, units: int) -> Optional[float]:
         if units == QgsUnitTypes.DistanceMeters:
@@ -1208,6 +1208,7 @@ class TerraLinkDialog(QDialog, FORM_CLASS):
             "obstacle_values": [],
             "obstacle_range_lower": None,
             "obstacle_range_upper": None,
+            "raster_units": units,
         }
 
         values = self._parse_values(self.patch_value_line.text())
@@ -1459,6 +1460,13 @@ class TerraLinkDialog(QDialog, FORM_CLASS):
                 if patches_connected is not None:
                     self._append_log(f"  Patches connected: {patches_connected}", "SUMMARY")
                 if budget_used is not None and budget_total is not None:
+                    is_raster = "raster_rows" in stats or "raster_cols" in stats
+                    if is_raster:
+                        try:
+                            budget_used = f"{float(budget_used):.2f}"
+                            budget_total = f"{float(budget_total):.2f}"
+                        except Exception:
+                            pass
                     self._append_log(f"  Budget used: {budget_used}/{budget_total}", "SUMMARY")
                 metrics_path = (stats.get("landscape_metrics_path") or "").strip()
                 if metrics_path:
