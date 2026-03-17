@@ -15,14 +15,13 @@ class TerraLinkLaunchAlgorithm(QgsProcessingAlgorithm):
         return self.ALG_ID
 
     def displayName(self) -> str:
-        return self.tr("TerraLink Corridor Generation")
+        return self.tr("Open TerraLink")
 
     def group(self) -> str:
-        # No subgroup: show directly under the SORUS provider.
-        return ""
+        return self.tr("TerraLink")
 
     def groupId(self) -> str:
-        return ""
+        return "terralink"
 
     def shortHelpString(self) -> str:
         return self.tr("Opens the TerraLink dialog so you can configure and run analyses.")
@@ -57,7 +56,7 @@ class TerraLinkProcessingProvider(QgsProcessingProvider):
         return "terralink_v1_7"
 
     def name(self) -> str:
-        return self.tr("TerraLink")
+        return self.tr("SORUS")
 
     def tr(self, string: str) -> str:
         return QCoreApplication.translate("TerraLinkProcessingProvider", string)
