@@ -8,7 +8,10 @@
 
 - Set key criteria such as minimum patch size, optimization mode and your budget. 
 
-- Optimization modes: **Largest Single Network** and **Most Connectivity** (utility/ROI-based selection with shortcut efficiency for redundancy).
+- Optimization modes: **Largest Single Network**, **Most Connected Area**, **Landscape Fluidity**, and **Reachable Habitat**.
+- **Most Connected Area** maximizes total habitat contained in the final connected networks, then uses remaining budget without reducing that objective.
+- **Landscape Fluidity** improves internal mobility by adding corridors that meaningfully reduce detours and increase shortcut efficiency.
+- **Reachable Habitat** maximizes gain in reachable habitat within a species dispersal distance, so results depend strongly on movement scale and any patch-quality weighting you choose.
 
 - Enable **Impassable Land Classes** when there are areas that corridors must avoid (roads, water, cities). Set values for this in raster, or select impassable polygon layers in vector mode.
 
@@ -16,7 +19,11 @@
 
 - If performance is slow, resample very fine rasters or trim your AOI before running.
 
-- The output data comes embedded with helpful info. Raster cells store the connected component size, and vector corridor attributes include patch ids, corridor area, connected area, and efficiency. 
+- The output data comes embedded with helpful info. Raster corridor cells can be assigned in three ways (`Assign corridor cells`):
+  - `Sum area of patches directly connected`: value is patch1 area + patch2 area (pixels).
+  - `Sum area of total network`: value is total connected network area (pixels) after corridor inclusion.
+  - `Efficiency (corridor area / connected patches)`: value is corridor area divided by (patch1 area + patch2 area) (unitless).
+  Vector corridor attributes include patch ids, corridor area, connected area, and efficiency. 
 - Vector runs also create a contiguous areas layer (patches + corridors dissolved by network).
 - Raster and vector runs add summary table layers in QGIS, and vector runs also write a summary CSV.
 - Landscape metrics reports are written alongside outputs as `landscape_metrics_<input layer>.txt`.

@@ -4,8 +4,18 @@ from typing import Dict, List, Set, Tuple, Optional
 
 
 class StrategyType(str, Enum):
-    LARGEST_NETWORK = "largest_network"
-    CIRCUIT_UTILITY = "circuit_utility"
+    # Canonical strategy keys (snake_case, matching UI labels).
+    LARGEST_SINGLE_NETWORK = "largest_single_network"
+    MOST_CONNECTED_HABITAT = "most_connected_habitat"
+    LANDSCAPE_FLUIDITY = "landscape_fluidity"
+    REACHABLE_HABITAT_ADVANCED = "reachable_habitat_advanced"
+
+    # Back-compat aliases for older saved projects/settings.
+    LARGEST_NETWORK = "largest_single_network"
+    BIGCONNECT = "most_connected_habitat"
+    HABITAT_AVAILABILITY = "reachable_habitat_advanced"
+    LANDSCAPE_FLUIDITY_A = "landscape_fluidity"
+    LANDSCAPE_FLUIDITY_A1 = "landscape_fluidity"
 
 
 class UnionFind:

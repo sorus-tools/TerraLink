@@ -18,15 +18,34 @@ class TerraLinkPlugin:
         self.action = None
         self.provider = None
 
+    def _plugin_version_label(self) -> str:
+        meta_path = os.path.join(self.plugin_dir, "metadata.txt")
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                for raw in fh:
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    if key.strip().lower() == "version":
+                        v = val.strip()
+                        return f"v{v}" if v else ""
+        except Exception:
+            pass
+        return ""
+
     def initGui(self):
-        self.action = QAction("Run TerraLink", self.iface.mainWindow())
+        version_label = self._plugin_version_label()
+        action_label = "Run TerraLink" if not version_label else f"Run TerraLink ({version_label})"
+        self.action = QAction(action_label, self.iface.mainWindow())
         icon_path = os.path.join(self.plugin_dir, "icon.png")
         icon = QIcon(icon_path)
         if not icon.isNull():
             self.action.setIcon(icon)
         self.action.triggered.connect(self.run)
         self.iface.addToolBarIcon(self.action)
-        self.iface.addPluginToMenu("&TerraLink", self.action)
+        menu_label = "&TerraLink" if not version_label else f"&TerraLink ({version_label})"
+        self.iface.addPluginToMenu(menu_label, self.action)
 
         if self.provider is None:
             self.provider = TerraLinkProcessingProvider(self)
@@ -35,7 +54,9 @@ class TerraLinkPlugin:
     def unload(self):
         if self.action is not None:
             self.iface.removeToolBarIcon(self.action)
-            self.iface.removePluginMenu("&TerraLink", self.action)
+            version_label = self._plugin_version_label()
+            menu_label = "&TerraLink" if not version_label else f"&TerraLink ({version_label})"
+            self.iface.removePluginMenu(menu_label, self.action)
         if self.provider is not None:
             try:
                 registry = QgsApplication.processingRegistry()
